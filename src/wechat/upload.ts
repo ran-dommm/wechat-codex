@@ -1,11 +1,27 @@
 import { readFileSync, statSync } from 'node:fs';
+import { basename } from 'node:path';
 import { createHash, randomBytes, createCipheriv } from 'node:crypto';
 import { logger } from '../logger.js';
+
+function randomWechatUin(): string {
+  const uint32 = randomBytes(4).readUInt32BE(0);
+  return Buffer.from(String(uint32), 'utf-8').toString('base64');
+}
 
 const CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
 const CDN_MAX_RETRIES = 3;
 const SEND_TIMEOUT_MS = 30_000;
 const IMAGE_MAX_SIZE = 20 * 1024 * 1024; // 20 MB
+const FILE_MAX_SIZE = 100 * 1024 * 1024; // 100 MB
+// Mirrors the channel_version CLI-WeChat-Bridge sends with every WeChat API
+// call. Some endpoints (including getuploadurl) reject requests that omit it.
+const CHANNEL_VERSION = '0.3.0';
+
+// Matches wechat-transport in CLI-WeChat-Bridge: 1=image, 2=video, 3=file, 4=voice.
+const MEDIA_TYPE_IMAGE = 1;
+const MEDIA_TYPE_VIDEO = 2;
+const MEDIA_TYPE_FILE = 3;
+const MEDIA_TYPE_VOICE = 4;
 
 function aesEcbPaddedSize(plaintextSize: number): number {
   return Math.ceil((plaintextSize + 1) / 16) * 16;
@@ -26,6 +42,12 @@ interface UploadResult {
   filesize: number;
 }
 
+export interface FileUploadResult extends UploadResult {
+  fileName: string;
+  md5: string;
+  rawSize: number;
+}
+
 async function getUploadUrl(
   baseUrl: string,
   token: string,
@@ -44,26 +66,37 @@ async function getUploadUrl(
 
   try {
     const url = `${baseUrl}/ilink/bot/getuploadurl`;
+    const body = JSON.stringify({
+      ...params,
+      no_need_thumb: true,
+      base_info: { channel_version: CHANNEL_VERSION },
+    });
     const res = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${token}`,
         'AuthorizationType': 'ilink_bot_token',
+        'X-WECHAT-UIN': randomWechatUin(),
+        'Content-Length': String(Buffer.byteLength(body, 'utf-8')),
       },
-      body: JSON.stringify({
-        ...params,
-        no_need_thumb: true,
-      }),
+      body,
       signal: controller.signal,
     });
 
+    const rawBody = await res.text();
     if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`getUploadUrl HTTP ${res.status}: ${text}`);
+      throw new Error(`getUploadUrl HTTP ${res.status}: ${rawBody}`);
     }
 
-    return (await res.json()) as { upload_param?: string };
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(rawBody);
+    } catch {
+      throw new Error(`getUploadUrl returned non-JSON body: ${rawBody.slice(0, 400)}`);
+    }
+    logger.debug('getUploadUrl response', parsed);
+    return parsed as { upload_param?: string };
   } finally {
     clearTimeout(timer);
   }
@@ -124,18 +157,21 @@ async function uploadBufferToCdn(
   return downloadParam;
 }
 
-export async function uploadImage(
+async function prepareUpload(
   baseUrl: string,
   token: string,
   toUserId: string,
   filePath: string,
-): Promise<UploadResult> {
+  mediaType: number,
+  label: string,
+  maxSize: number,
+): Promise<FileUploadResult> {
   const stat = statSync(filePath);
   if (!stat.isFile()) {
     throw new Error(`Not a file: ${filePath}`);
   }
-  if (stat.size > IMAGE_MAX_SIZE) {
-    throw new Error(`Image too large: ${stat.size} bytes exceeds ${IMAGE_MAX_SIZE} limit`);
+  if (stat.size > maxSize) {
+    throw new Error(`${label} too large: ${stat.size} bytes exceeds ${maxSize} limit`);
   }
 
   const plaintext = readFileSync(filePath);
@@ -144,12 +180,13 @@ export async function uploadImage(
   const filesize = aesEcbPaddedSize(rawsize);
   const filekey = randomBytes(16).toString('hex');
   const aeskey = randomBytes(16);
+  const fileName = basename(filePath);
 
-  logger.info('Uploading image', { filePath, rawsize });
+  logger.info(`Uploading ${label}`, { filePath, rawsize });
 
   const uploadResp = await getUploadUrl(baseUrl, token, {
     filekey,
-    media_type: 1, // image
+    media_type: mediaType,
     to_user_id: toUserId,
     rawsize,
     rawfilemd5,
@@ -163,7 +200,56 @@ export async function uploadImage(
 
   const downloadParam = await uploadBufferToCdn(plaintext, uploadResp.upload_param, filekey, aeskey);
 
-  logger.info('Image upload complete', { downloadParamLength: downloadParam.length });
+  logger.info(`${label} upload complete`, { downloadParamLength: downloadParam.length });
 
-  return { downloadParam, aeskey, filesize };
+  return { downloadParam, aeskey, filesize, fileName, md5: rawfilemd5, rawSize: rawsize };
+}
+
+export async function uploadImage(
+  baseUrl: string,
+  token: string,
+  toUserId: string,
+  filePath: string,
+): Promise<UploadResult> {
+  const result = await prepareUpload(
+    baseUrl, token, toUserId, filePath,
+    MEDIA_TYPE_IMAGE, 'image', IMAGE_MAX_SIZE,
+  );
+  return { downloadParam: result.downloadParam, aeskey: result.aeskey, filesize: result.filesize };
+}
+
+export async function uploadFile(
+  baseUrl: string,
+  token: string,
+  toUserId: string,
+  filePath: string,
+): Promise<FileUploadResult> {
+  return prepareUpload(
+    baseUrl, token, toUserId, filePath,
+    MEDIA_TYPE_FILE, 'file', FILE_MAX_SIZE,
+  );
+}
+
+export async function uploadVoice(
+  baseUrl: string,
+  token: string,
+  toUserId: string,
+  filePath: string,
+): Promise<FileUploadResult> {
+  return prepareUpload(
+    baseUrl, token, toUserId, filePath,
+    MEDIA_TYPE_VOICE, 'voice', FILE_MAX_SIZE,
+  );
+}
+
+export async function uploadVideo(
+  baseUrl: string,
+  token: string,
+  toUserId: string,
+  filePath: string,
+): Promise<FileUploadResult> {
+  return prepareUpload(
+    baseUrl, token, toUserId, filePath,
+    MEDIA_TYPE_VIDEO, 'video', FILE_MAX_SIZE,
+  );
 }

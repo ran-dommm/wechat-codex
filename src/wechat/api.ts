@@ -6,14 +6,16 @@ import type {
 } from './types.js';
 import { logger } from '../logger.js';
 
-function generateUin(): string {
-  return randomBytes(4).toString('base64');
+const CHANNEL_VERSION = '0.3.0';
+
+function randomWechatUin(): string {
+  const uint32 = randomBytes(4).readUInt32BE(0);
+  return Buffer.from(String(uint32), 'utf-8').toString('base64');
 }
 
 export class WeChatApi {
   private readonly token: string;
   private readonly baseUrl: string;
-  private readonly uin: string;
 
   constructor(token: string, baseUrl: string = 'https://ilinkai.weixin.qq.com') {
     if (baseUrl && (!baseUrl.startsWith('https://') || !/(?:^|\.)(?:weixin\.qq\.com|wechat\.com)(\/|$)/.test(baseUrl.slice('https://'.length)))) {
@@ -22,35 +24,37 @@ export class WeChatApi {
     }
     this.token = token;
     this.baseUrl = baseUrl.replace(/\/+$/, '');
-    this.uin = generateUin();
   }
 
-  private headers(): Record<string, string> {
+  private headers(bodyLength: number): Record<string, string> {
     return {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${this.token}`,
       'AuthorizationType': 'ilink_bot_token',
-      'X-WECHAT-UIN': this.uin,
+      'X-WECHAT-UIN': randomWechatUin(),
+      'Content-Length': String(bodyLength),
     };
   }
 
   private async request<T>(
     path: string,
-    body: unknown,
+    body: Record<string, unknown>,
     timeoutMs: number = 15_000,
   ): Promise<T> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     const url = `${this.baseUrl}/${path}`;
+    const payload = { ...body, base_info: { channel_version: CHANNEL_VERSION } };
+    const bodyStr = JSON.stringify(payload);
 
-    logger.debug('API request', { url, body });
+    logger.debug('API request', { url, body: payload });
 
     try {
       const res = await fetch(url, {
         method: 'POST',
-        headers: this.headers(),
-        body: JSON.stringify(body),
+        headers: this.headers(Buffer.byteLength(bodyStr, 'utf-8')),
+        body: bodyStr,
         signal: controller.signal,
       });
 
@@ -81,7 +85,7 @@ export class WeChatApi {
   }
 
   async sendMessage(req: SendMessageReq): Promise<void> {
-    await this.request('ilink/bot/sendmessage', req);
+    await this.request('ilink/bot/sendmessage', req as unknown as Record<string, unknown>);
   }
 
   async getUploadUrl(

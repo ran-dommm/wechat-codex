@@ -1,5 +1,5 @@
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import * as pty from 'node-pty';
 
@@ -10,8 +10,16 @@ const SESSION_DISCOVER_INTERVAL_MS = 1000;
 
 export type CodexSpawnMode = 'plan' | 'workspace' | 'danger';
 
+export type AttachmentKind = 'image' | 'file' | 'voice' | 'video';
+
+export interface WechatAttachment {
+  kind: AttachmentKind;
+  path: string;
+}
+
 export interface NativeBridgeEvents {
   onWechatReply: (text: string) => void;
+  onWechatAttachment: (attachment: WechatAttachment) => void;
   onWechatTurnComplete: () => void;
   onError: (message: string) => void;
   onExit: (code: number | null) => void;
@@ -371,15 +379,22 @@ export class NativeCodexBridge {
 
     const source = turn.source;
     const texts = turn.texts.map((t) => t.trim()).filter(Boolean);
-    const finalText = texts.join('\n\n');
+    const rawFinal = texts.join('\n\n');
+    const parsed = parseWechatAttachments(rawFinal);
+    const { visibleText } = parsed;
+    const attachments = parsed.attachments.map((a) => ({
+      kind: a.kind,
+      path: isAbsolute(a.path) ? a.path : resolvePath(this.cwd, a.path),
+    }));
 
     // Only emit to WeChat for resolved turns. An 'unknown' source means the
     // turn had no user_message (internal/background turn) — silently ignore.
     if (source === 'wechat' || source === 'terminal') {
       if (reason === 'aborted') {
         if (source === 'wechat') this.events.onError('Turn aborted');
-      } else if (finalText) {
-        this.events.onWechatReply(finalText);
+      } else {
+        if (visibleText) this.events.onWechatReply(visibleText);
+        for (const a of attachments) this.events.onWechatAttachment(a);
       }
       if (source === 'wechat') {
         this.events.onWechatTurnComplete();
@@ -405,6 +420,53 @@ function textsMatch(a: string, b: string): boolean {
   const nb = norm(b);
   if (!na || !nb) return false;
   return na === nb;
+}
+
+// Parse a fenced ```wechat-attachments ... ``` block at the end of Codex's
+// final answer. Matches the convention used by CLI-WeChat-Bridge so users can
+// instruct Codex uniformly across projects.
+//
+// Example:
+//   Here is the chart you requested.
+//
+//   ```wechat-attachments
+//   image /abs/path/to/chart.png
+//   file  /abs/path/to/report.pdf
+//   ```
+const WECHAT_ATTACHMENT_BLOCK_RE =
+  /\n```wechat-attachments[ \t]*\n([\s\S]*?)\n```[ \t]*\s*$/;
+
+function parseWechatAttachments(text: string): {
+  visibleText: string;
+  attachments: WechatAttachment[];
+} {
+  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\s+$/, '');
+  const padded = normalized.startsWith('\n') ? normalized : `\n${normalized}`;
+  const match = padded.match(WECHAT_ATTACHMENT_BLOCK_RE);
+  if (!match) return { visibleText: normalized.trim(), attachments: [] };
+
+  const attachments: WechatAttachment[] = [];
+  const lines = match[1]
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const lineRe = /^(image|file|video|voice)\s+(.+)$/i;
+
+  for (const line of lines) {
+    const m = line.match(lineRe);
+    if (!m) {
+      // Bail on malformed block; treat whole text as visible.
+      return { visibleText: normalized.trim(), attachments: [] };
+    }
+    const kind = m[1].toLowerCase() as AttachmentKind;
+    const path = m[2].trim().replace(/^["']|["']$/g, '');
+    if (!path) continue;
+    attachments.push({ kind, path });
+  }
+
+  const blockStart = padded.length - match[0].length;
+  const visibleText = padded.slice(0, blockStart).trim();
+  return { visibleText, attachments };
 }
 
 function buildEnv(): Record<string, string> {

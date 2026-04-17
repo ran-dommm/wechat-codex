@@ -26,9 +26,51 @@
 
 ## 1) 运行环境
 
-- Linux / macOS / Windows（Node.js 22+ 推荐）
+- Linux / macOS / Windows
+- Node.js `>= 22`（推荐使用 Node.js LTS）
 - 已安装并可在命令行直接运行 `codex`
+- 已安装 `OpenClaw`（用于微信侧/桥接侧相关能力）
+- 已安装 `Clawbot`（用于机器人端能力）
 - 可访问微信桥接所需网络环境
+
+建议先验证 Node 与 npm：
+
+```bash
+node -v
+npm -v
+```
+
+若本机没有 Node.js 22，可用 `nvm` 安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+source ~/.bashrc
+nvm install 22
+nvm use 22
+node -v
+```
+
+### OpenClaw 安装
+
+
+```bash
+npm install -g openclaw@latest
+```
+
+### Clawbot 安装
+
+
+```bash
+npx -y @tencent-weixin/openclaw-weixin-cli@latest install
+```
+
+安装后请确保命令可执行（或服务可正常启动）：
+
+```bash
+openclaw --help
+clawbot --help
+codex --help
+```
 
 ## 2) 依赖工具（媒体增强相关）
 

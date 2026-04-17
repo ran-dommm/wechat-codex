@@ -187,6 +187,36 @@ async function runDaemon(): Promise<void> {
     }
   }
 
+  async function sendAttachmentToWechat(
+    attachment: { kind: 'image' | 'file' | 'voice' | 'video'; path: string },
+  ): Promise<void> {
+    if (!lastRecipient) {
+      logger.warn('Drop attachment: no WeChat recipient yet', { attachment });
+      return;
+    }
+    if (!existsSync(attachment.path)) {
+      logger.warn('Drop attachment: file not found', { attachment });
+      await sendTextToWechat(`⚠️ 无法发送附件（文件不存在）：${attachment.path}`);
+      return;
+    }
+    try {
+      const { userId, contextToken } = lastRecipient;
+      if (attachment.kind === 'image') {
+        await sender.sendImage(userId, contextToken, attachment.path);
+      } else if (attachment.kind === 'file') {
+        await sender.sendFile(userId, contextToken, attachment.path);
+      } else if (attachment.kind === 'voice') {
+        await sender.sendVoice(userId, contextToken, attachment.path);
+      } else if (attachment.kind === 'video') {
+        await sender.sendVideo(userId, contextToken, attachment.path);
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logger.warn('Failed to send attachment to WeChat', { attachment, error: errMsg });
+      await sendTextToWechat(`⚠️ 发送附件失败 (${attachment.kind}): ${attachment.path}\n${errMsg.slice(0, 400)}`);
+    }
+  }
+
   async function sendWechatMessageToCodex(
     userText: string,
     media: ReturnType<typeof extractFirstSupportedMedia>,
@@ -254,6 +284,9 @@ async function runDaemon(): Promise<void> {
   const bridge = new NativeCodexBridge(cwd, {
     onWechatReply: (text) => {
       void sendTextToWechat(text);
+    },
+    onWechatAttachment: (attachment) => {
+      void sendAttachmentToWechat(attachment);
     },
     onWechatTurnComplete: () => {
       session.state = 'idle';

@@ -21,6 +21,7 @@ export interface CDNMedia {
   aes_key: string;
   encrypt_query_param: string;
   cdn_url?: string;
+  encrypt_type?: number;
 }
 
 export interface TextItem {
@@ -32,6 +33,7 @@ export interface ImageItem {
   media?: CDNMedia;
   url?: string;
   aeskey?: string;
+  mid_size?: number;
 }
 
 export interface VoiceItem {
