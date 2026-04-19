@@ -1,22 +1,30 @@
 import { createInterface } from 'node:readline';
 import process from 'node:process';
 import { spawnSync } from 'node:child_process';
-import { join } from 'node:path';
-import { existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 
 import { WeChatApi } from './wechat/api.js';
 import { loadLatestAccount } from './wechat/accounts.js';
 import { startQrLogin, waitForQrScan } from './wechat/login.js';
 import { createMonitor, type MonitorCallbacks } from './wechat/monitor.js';
 import { createSender } from './wechat/send.js';
-import { buildCodexPrompt, cleanupTempFiles, extractFirstSupportedMedia, extractText, prepareMediaForCodex } from './wechat/media.js';
+import {
+  buildCodexPrompt,
+  cleanupTempFiles,
+  downloadIncomingFileToPending,
+  extractFirstSupportedMedia,
+  extractText,
+  prepareMediaForCodex,
+  type PendingDownloadedFile,
+} from './wechat/media.js';
 import { createSessionStore, type Session } from './session.js';
 import { routeCommand, type CommandContext, type CommandResult } from './commands/router.js';
 import { NativeCodexBridge } from './codex/native-bridge.js';
 import { DEFAULT_WORKING_DIRECTORY, loadConfig, saveConfig } from './config.js';
 import { logger } from './logger.js';
 import { dequeueQueuedMessage, enqueueQueuedMessage } from './message-queue.js';
-import { DATA_DIR } from './constants.js';
+import { DATA_DIR, TMP_DIR } from './constants.js';
 import { splitMessage } from './utils/chunk.js';
 import { MessageType, type WeixinMessage } from './wechat/types.js';
 
@@ -28,6 +36,64 @@ interface QueuedCodexMessage {
 }
 
 const queuedMessages = new Map<string, QueuedCodexMessage[]>();
+
+// Per-user pending files. When a user sends one or more file messages via
+// WeChat, we stash them here (on disk) until the user sends a follow-up
+// text message with the processing request, at which point all pending
+// files are attached to the Codex turn and cleared.
+const pendingIncomingFiles = new Map<string, PendingDownloadedFile[]>();
+
+function appendPendingFile(userId: string, file: PendingDownloadedFile): number {
+  const arr = pendingIncomingFiles.get(userId) ?? [];
+  arr.push(file);
+  pendingIncomingFiles.set(userId, arr);
+  return arr.length;
+}
+
+function takePendingFiles(userId: string): PendingDownloadedFile[] {
+  const arr = pendingIncomingFiles.get(userId) ?? [];
+  pendingIncomingFiles.delete(userId);
+  return arr;
+}
+
+function discardPendingFiles(userId: string): number {
+  const arr = pendingIncomingFiles.get(userId) ?? [];
+  for (const f of arr) {
+    try {
+      unlinkSync(f.path);
+    } catch {
+      // ignore
+    }
+    try {
+      const parent = dirname(f.path);
+      if (parent.startsWith(TMP_DIR)) {
+        rmSync(parent, { recursive: true, force: true });
+      }
+    } catch {
+      // ignore
+    }
+  }
+  pendingIncomingFiles.delete(userId);
+  return arr.length;
+}
+
+function formatPendingFileBlock(files: PendingDownloadedFile[], userRequest: string): string {
+  const list = files
+    .map((f, idx) => `${idx + 1}. ${f.fileName} — 绝对路径: ${f.path}`)
+    .join('\n');
+  const trimmedRequest = userRequest.trim();
+  const requestBody = trimmedRequest
+    || '（用户未给出具体指令，请先阅读每个文件的内容并回复其概要、结构以及可能的处理建议。）';
+  return [
+    `以下是用户通过微信上传的 ${files.length} 个文件，请根据「用户需求」处理这些文件。`,
+    '',
+    '待处理文件：',
+    list,
+    '',
+    '用户需求：',
+    requestBody,
+  ].join('\n');
+}
 
 interface WechatRecipient {
   userId: string;
@@ -231,6 +297,14 @@ async function runDaemon(): Promise<void> {
     let prompt = userText.trim();
     let imagePaths: string[] = [];
 
+    // Pluck any files the user has accumulated via previous WeChat file
+    // messages. They ride along with this turn's request and get cleaned up
+    // after the turn completes.
+    const pendingFiles = takePendingFiles(fromUserId);
+    for (const f of pendingFiles) {
+      tempFiles.push(f.path);
+    }
+
     try {
       if (media) {
         const prepared = await prepareMediaForCodex(media);
@@ -246,6 +320,10 @@ async function runDaemon(): Promise<void> {
 
         prompt = buildCodexPrompt(userText, prepared);
         imagePaths = prepared.imagePaths;
+      }
+
+      if (pendingFiles.length > 0) {
+        prompt = formatPendingFileBlock(pendingFiles, prompt);
       }
 
       if (!prompt) {
@@ -332,7 +410,13 @@ async function runDaemon(): Promise<void> {
           accountId: account.accountId,
           session,
           updateSession,
-          clearSession: () => sessionStore.clear(account.accountId, session),
+          clearSession: () => {
+            const dropped = discardPendingFiles(fromUserId);
+            if (dropped > 0) {
+              logger.info('Dropped pending files on /clear', { fromUserId, count: dropped });
+            }
+            return sessionStore.clear(account.accountId, session);
+          },
           text: userText,
         };
 
@@ -357,6 +441,40 @@ async function runDaemon(): Promise<void> {
           return;
         }
         if (result.handled) return;
+      }
+
+      // If the user sent a generic file, stash it and wait for a text request.
+      // This avoids pasting raw file contents into Codex's TUI input box and
+      // ensures all accumulated files + the eventual request go to Codex
+      // together in a single turn.
+      if (media && media.kind === 'file') {
+        try {
+          const downloaded = await downloadIncomingFileToPending(media.item);
+          if (!downloaded) {
+            await sender.sendText(fromUserId, contextToken,
+              '⚠️ 文件已收到，但下载或解密失败。请重发。');
+            return;
+          }
+          const total = appendPendingFile(fromUserId, downloaded);
+          const lines = [
+            `📎 已接收文件：${downloaded.fileName}`,
+            `目前共有 ${total} 个待处理文件。`,
+            '',
+            '请继续发送文件，或发送对这些文件的处理需求（例如「转成 CSV」「统计坐标点数量」）。',
+            '收到文字需求后，我会把所有文件和需求一起交给 Codex。',
+          ];
+          if (userText.trim()) {
+            lines.push('');
+            lines.push('（本条消息中的文字已忽略；下一条发送文字需求即可触发处理。）');
+          }
+          await sender.sendText(fromUserId, contextToken, lines.join('\n'));
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          logger.error('Failed to stash pending file', { error: errMsg });
+          await sender.sendText(fromUserId, contextToken,
+            `⚠️ 保存文件失败：${errMsg.slice(0, 200)}`);
+        }
+        return;
       }
 
       // Queue if busy

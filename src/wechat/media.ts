@@ -1,5 +1,5 @@
-import { mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
-import { extname, join } from 'node:path';
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { basename, extname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { MessageItem } from './types.js';
 import { MessageItemType, type CDNMedia } from './types.js';
@@ -14,7 +14,7 @@ import {
   type MediaProbeResult,
 } from '../media/transcribe.js';
 
-export type SupportedMediaKind = 'image' | 'voice' | 'audio' | 'video';
+export type SupportedMediaKind = 'image' | 'voice' | 'audio' | 'video' | 'file';
 
 export interface SupportedMedia {
   kind: SupportedMediaKind;
@@ -45,6 +45,17 @@ const defaultMediaPreparationDeps: MediaPreparationDeps = {
   extractVideoPreviewImage: defaultExtractVideoPreviewImage,
   transcribeAudio: defaultTranscribeAudio,
 };
+
+const AUDIO_FILE_EXTENSIONS = new Set([
+  '.aac', '.amr', '.flac', '.m4a', '.mp3', '.ogg', '.opus', '.wav', '.wma', '.silk',
+]);
+
+const VIDEO_FILE_EXTENSIONS = new Set([
+  '.avi', '.m4v', '.mkv', '.mov', '.mp4', '.mpeg', '.mpg', '.ts', '.webm', '.wmv',
+]);
+
+const MAX_INLINE_TEXT_BYTES = 512 * 1024;
+const MAX_INLINE_TEXT_CHARS = 20_000;
 
 function detectMimeType(data: Buffer): string {
   if (data[0] === 0x89 && data[1] === 0x50) return 'image/png';
@@ -200,6 +211,63 @@ export function extractVoiceTranscript(item: MessageItem): string | undefined {
   return trimTranscript(item.voice_item?.text) ?? trimTranscript(item.voice_item?.voice_text);
 }
 
+export interface PendingDownloadedFile {
+  path: string;
+  fileName: string;
+  sizeBytes: number;
+}
+
+function sanitizeFilename(name?: string): string | undefined {
+  if (!name) return undefined;
+  const base = basename(name).trim();
+  if (!base) return undefined;
+  // eslint-disable-next-line no-control-regex
+  return base.replace(/[\x00-\x1f/\\]+/g, '_').slice(0, 200);
+}
+
+/**
+ * Download a WeChat FILE message to a stable path under the pending directory,
+ * preserving the original filename. Returns `null` if CDN fields are missing.
+ *
+ * The caller is responsible for eventually cleaning up the returned path
+ * (e.g. after the Codex turn that consumed it completes).
+ */
+export async function downloadIncomingFileToPending(
+  item: MessageItem,
+): Promise<PendingDownloadedFile | null> {
+  const cdnMedia = extractAnyCdnMedia(item);
+  if (!cdnMedia?.encrypt_query_param || !cdnMedia?.aes_key) {
+    return null;
+  }
+  try {
+    const decrypted = await downloadAndDecrypt(cdnMedia.encrypt_query_param, cdnMedia.aes_key);
+    const origName = item.file_item?.file_name;
+    const safeName = sanitizeFilename(origName) ?? `file${detectBinaryExtension(decrypted, item)}`;
+    const dir = join(TMP_DIR, 'pending', randomUUID());
+    mkdirSync(dir, { recursive: true });
+    const outPath = join(dir, safeName);
+    writeFileSync(outPath, decrypted);
+    logger.info('Pending file saved', { path: outPath, size: decrypted.length });
+    return { path: outPath, fileName: safeName, sizeBytes: decrypted.length };
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.warn('Failed to download pending file', { error: errMsg });
+    return null;
+  }
+}
+
+function classifyFileItemKind(item: MessageItem): 'audio' | 'video' | 'file' {
+  const fileName = item.file_item?.file_name;
+  const ext = fileName ? extname(fileName).toLowerCase() : '';
+  if (AUDIO_FILE_EXTENSIONS.has(ext)) {
+    return 'audio';
+  }
+  if (VIDEO_FILE_EXTENSIONS.has(ext)) {
+    return 'video';
+  }
+  return 'file';
+}
+
 export function extractFirstSupportedMedia(items?: MessageItem[]): SupportedMedia | undefined {
   const match = items?.find((item) => (
     item.type === MessageItemType.IMAGE
@@ -218,7 +286,7 @@ export function extractFirstSupportedMedia(items?: MessageItem[]): SupportedMedi
     case MessageItemType.VOICE:
       return { kind: 'voice', item: match };
     case MessageItemType.FILE:
-      return { kind: 'audio', item: match };
+      return { kind: classifyFileItemKind(match), item: match };
     case MessageItemType.VIDEO:
       return { kind: 'video', item: match };
     default:
@@ -293,6 +361,68 @@ async function prepareAudioForCodex(
     return prepared;
   } catch (error) {
     prepared.immediateReply = describeMediaError('audio', error);
+    return prepared;
+  }
+}
+
+function looksLikeTextFile(data: Buffer): boolean {
+  if (!data.length) {
+    return true;
+  }
+  if (data.includes(0x00)) {
+    return false;
+  }
+  let printable = 0;
+  for (const byte of data) {
+    const isWhitespace = byte === 0x09 || byte === 0x0A || byte === 0x0D;
+    const isAsciiPrintable = byte >= 0x20 && byte <= 0x7E;
+    const isUtf8LeadOrContinuation = byte >= 0x80;
+    if (isWhitespace || isAsciiPrintable || isUtf8LeadOrContinuation) {
+      printable += 1;
+    }
+  }
+  return printable / data.length > 0.85;
+}
+
+async function prepareFileForCodex(
+  item: MessageItem,
+  deps: MediaPreparationDeps,
+): Promise<PreparedMediaForCodex> {
+  const prepared = createPreparedMedia('file', '请根据下面的文件内容回答用户。');
+  const fileName = item.file_item?.file_name;
+
+  try {
+    const mediaPath = await deps.downloadBinaryMediaToTemp(item);
+    if (!mediaPath) {
+      prepared.immediateReply = '⚠️ 文件已收到，但下载或解密失败。请重发一次文件。';
+      return prepared;
+    }
+    prepared.tempFiles.push(mediaPath);
+    prepared.promptFragments.push(`文件名：${fileName ?? basename(mediaPath)}`);
+    prepared.promptFragments.push(`本地文件路径：${mediaPath}`);
+
+    const raw = readFileSync(mediaPath);
+    if (!looksLikeTextFile(raw)) {
+      prepared.promptFragments.push('该文件看起来是二进制文件，暂未自动抽取正文内容。');
+      return prepared;
+    }
+
+    const inlineBuf = raw.subarray(0, Math.min(raw.length, MAX_INLINE_TEXT_BYTES));
+    const inlineText = inlineBuf.toString('utf-8').trim();
+    if (!inlineText) {
+      prepared.promptFragments.push('文件内容为空。');
+      return prepared;
+    }
+
+    const truncatedByBytes = raw.length > MAX_INLINE_TEXT_BYTES;
+    const finalText = inlineText.length > MAX_INLINE_TEXT_CHARS
+      ? `${inlineText.slice(0, MAX_INLINE_TEXT_CHARS)}\n\n[...内容已截断...]`
+      : inlineText;
+    prepared.promptFragments.push(`文件内容${truncatedByBytes ? '（已按大小截断）' : ''}：\n${finalText}`);
+    return prepared;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    prepared.immediateReply = `⚠️ 文件已收到，但读取失败：${msg.slice(0, 160)}`;
     return prepared;
   }
 }
@@ -396,6 +526,10 @@ export async function prepareMediaForCodex(
 
   if (media.kind === 'audio') {
     return prepareAudioForCodex(media.item, resolvedDeps);
+  }
+
+  if (media.kind === 'file') {
+    return prepareFileForCodex(media.item, resolvedDeps);
   }
 
   return prepareVideoForCodex(media.item, resolvedDeps);

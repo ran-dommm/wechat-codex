@@ -13,6 +13,7 @@
   - 微信语音：使用微信侧已有转写文本
   - 音频文件：自动提取音轨并转写
   - 视频：自动提取关键帧 + 音频转写（可用时）
+  - 普通文件（如 `.geojson`/`.json`/`.txt`）：先落盘暂存，等待你发送处理需求后再与需求一起提交给 Codex
 - 会话指令（微信中斜杠命令）：
   - `/help` 查看帮助
   - `/status` 查看当前会话状态
@@ -99,6 +100,55 @@ codex --help
 ## 配置方式
 
 支持两种配置方式：初始化向导 + 手动编辑配置文件。
+
+## 发送文件前的 AGENTS.md 配置（必做）
+
+要让 Codex 在微信里真正发送文件/语音/视频，需要在工作目录下配置 `AGENTS.md`，明确告诉模型使用附件指令块。  
+否则模型通常只会返回文本说明，不会触发桥接层的附件发送。
+
+`wechat-codex` 约定：当最终回复末尾包含 `wechat-attachments` 代码块时，会自动解析并发送附件。
+
+请在你的项目根目录新增（或补充）`AGENTS.md`，加入类似下面的规范：
+
+~~~markdown
+# WeChat Attachment Output Rules
+
+当你需要通过微信发送图片、文件、语音、视频时，在最终回复末尾追加如下代码块：
+
+```wechat-attachments
+image /absolute/path/to/image.png
+file /absolute/path/to/report.pdf
+voice /absolute/path/to/voice.mp3
+video /absolute/path/to/video.mp4
+```
+
+规则：
+1. 每行格式：`<type> <path>`
+2. `type` 仅支持：`image` / `file` / `voice` / `video`
+3. 路径优先使用绝对路径；相对路径会按当前工作目录解析
+4. 附件代码块必须放在最终回复末尾，且语法正确
+5. 若文件不存在，不要输出该附件行，先给出错误说明
+~~~
+
+### 示例（模型输出）
+
+~~~text
+已生成周报，请查收。
+
+```wechat-attachments
+file /home/you/project/output/weekly-report.pdf
+```
+~~~
+
+### 验证是否生效
+
+1. 确认当前会话工作目录：微信发送 `/status`
+2. 确认该目录下有 `AGENTS.md`
+3. 让模型生成并发送一个已存在的测试文件
+4. 若未发送成功，检查：
+   - 附件块是否在最终回复末尾
+   - `type` 是否为 `image|file|voice|video`
+   - 路径是否存在且进程可读
 
 ## 方式一：初始化向导（推荐）
 
@@ -197,6 +247,14 @@ whisper --help
 
 - 确认 `config.env` 里的 `workingDirectory` 合法
 - 或在微信中执行 `/cwd <目录>` 动态切换
+
+### 4) 微信上传文件后为什么不会立即调用 Codex？
+
+这是当前设计：文件消息先保存到本地暂存目录，微信会提示你“请输入对文件的处理需求”。
+
+- 你可以连续发送多个文件，系统会累计等待
+- 当你再发一条文字需求时，系统会把“需求 + 所有待处理文件路径”一次性发给 Codex
+- 这样可以避免把文件原始内容误粘贴到 TUI 输入框，也避免“需要手动按 Enter 才发送”的问题
 
 ## 安全建议
 
