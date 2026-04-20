@@ -21,6 +21,7 @@ export interface NativeBridgeEvents {
   onWechatReply: (text: string) => void;
   onWechatAttachment: (attachment: WechatAttachment) => void;
   onWechatTurnComplete: () => void;
+  onTurnFinalized?: (info: { source: BridgeTurnSource; reason: BridgeTurnReason }) => void;
   onError: (message: string) => void;
   onExit: (code: number | null) => void;
 }
@@ -50,6 +51,8 @@ function buildCodexArgs(mode: CodexSpawnMode): string[] {
 }
 
 type TurnSource = 'unknown' | 'wechat' | 'terminal';
+export type BridgeTurnSource = TurnSource;
+export type BridgeTurnReason = 'complete' | 'aborted';
 
 interface ActiveTurn {
   turnId: string | null;
@@ -458,7 +461,7 @@ export class NativeCodexBridge {
     }
   }
 
-  private completeActiveTurn(reason: 'complete' | 'aborted'): void {
+  private completeActiveTurn(reason: BridgeTurnReason): void {
     const turn = this.activeTurn;
     this.activeTurn = null;
 
@@ -491,6 +494,7 @@ export class NativeCodexBridge {
       }
     }
 
+    this.events.onTurnFinalized?.({ source, reason });
     this.maybeDispatchQueued();
   }
 }

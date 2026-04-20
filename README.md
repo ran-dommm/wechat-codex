@@ -1,184 +1,217 @@
 # wechat-codex
 
-`wechat-codex` 是一个把微信消息桥接到本机 Codex CLI 的服务。  
-你可以在微信里发文字/图片/语音/音视频，服务会自动整理上下文并转交给 Codex，再把回复回传到微信。
+把微信变成 Codex 的聊天入口。  
+你在微信里发消息（文字、图片、语音、音视频、文件），`wechat-codex` 会把内容转给本机 Codex，再把结果回传到微信。
 
-## 支持的功能
 
-- 微信消息转发到本机 Codex（双向桥接）
-- 终端与微信双输入并存（同一实例可接收两端输入）
-- 自动排队：当 Codex 正在处理上一条请求时，新消息进入队列，完成后自动续跑
-- 多媒体支持：
-  - 图片：下载并解密后作为图片上下文传给 Codex
-  - 微信语音：使用微信侧已有转写文本
-  - 音频文件：自动提取音轨并转写
-  - 视频：自动提取关键帧 + 音频转写（可用时）
-  - 普通文件（如 `.geojson`/`.json`/`.txt`）：先落盘暂存，等待你发送处理需求后再与需求一起提交给 Codex
-- 会话指令（微信中斜杠命令）：
-  - `/help` 查看帮助
-  - `/status` 查看当前会话状态
-  - `/cwd <path>` 切换工作目录
-  - `/model <name>` 切换模型（会话级）
-  - `/mode <plan|workspace|danger>` 切换运行模式（需重启生效）
-  - `/clear` 清空当前会话
-  - `/skills` 列出可用 skills
+## 这个项目能做什么
 
-## 基础配置要求
+- 微信和终端都能给同一个 Codex 会话发消息
+- 忙碌时自动排队，不会丢消息
+- 支持多媒体输入
+- 支持把 Codex 生成的本地文件/图片/语音/视频发回微信
+- 支持会话控制命令（切目录、切模型、清空会话等）
 
-## 1) 运行环境
+### 支持的消息类型
 
-- Linux / macOS / Windows
-- Node.js `>= 22`（推荐使用 Node.js LTS）
-- 已安装并可在命令行直接运行 `codex`
-- 已安装 `OpenClaw`（用于微信侧/桥接侧相关能力）
-- 已安装 `Clawbot`（用于机器人端能力）
-- 可访问微信桥接所需网络环境
+- 文字：直接转给 Codex
+- 图片：下载并解密后，作为图片上下文传给 Codex
+- 微信语音消息：优先使用微信侧已有转写文本
+- 音频文件：自动提取音轨并转写（需要 `ffmpeg` + `ffprobe` + `whisper`）
+- 视频：自动抽关键帧 + 语音转写（同样依赖上面 3 个工具）
+- 普通文件（如 `.txt` `.json` `.geojson`）：先暂存，等你发“处理需求”后和需求一起交给 Codex
 
-建议先验证 Node 与 npm：
+## 1. 准备环境（第一次做）
 
-```bash
-node -v
-npm -v
-```
+### 1.1 必备
 
-若本机没有 Node.js 22，可用 `nvm` 安装：
+- Node.js `>= 22`
+- npm（随 Node.js 一起安装）
+- `codex` 命令可直接使用
+- `openclaw` 命令可直接使用
+- `clawbot` 命令可直接使用
+- 能正常访问微信桥接相关网络
+
+如果你还没安装 Node.js，推荐用 `nvm`：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
 source ~/.bashrc
 nvm install 22
 nvm use 22
-node -v
 ```
 
-### OpenClaw 安装
-
+安装 OpenClaw：
 
 ```bash
 npm install -g openclaw@latest
 ```
 
-### Clawbot 安装
+安装 Codex CLI：
 
+```bash
+npm install -g @openai/codex@latest
+```
+
+安装 Clawbot：
 
 ```bash
 npx -y @tencent-weixin/openclaw-weixin-cli@latest install
 ```
 
-安装后请确保命令可执行（或服务可正常启动）：
+安装后检查：
 
 ```bash
+node -v
+npm -v
+codex --help
 openclaw --help
 clawbot --help
-codex --help
 ```
 
-## 2) 依赖工具（媒体增强相关）
+### 1.2 可选（未测试）
 
-若你需要处理音频/视频，建议安装：
+安装并检查：
 
-- `ffmpeg`
-- `ffprobe`
-- `whisper`（用于语音转写）
-
-如果缺少这些工具，文字与图片流程仍可工作，但音视频处理会降级并给出提示。
-
-## 3) 默认数据目录
-
-默认数据目录：`~/.wechat-codex-bridge`
-
-其中包括（运行时自动创建）：
-
-- `config.env`（运行配置）
-- `logs/`（日志）
-- `tmp/`（媒体临时文件）
-
-你可以通过环境变量自定义目录：
-
-- `WCB_DATA_DIR=/your/path`
-
-## 配置方式
-
-支持两种配置方式：初始化向导 + 手动编辑配置文件。
-
-## 发送文件前的 AGENTS.md 配置（必做）
-
-要让 Codex 在微信里真正发送文件/语音/视频，需要在工作目录下配置 `AGENTS.md`，明确告诉模型使用附件指令块。  
-否则模型通常只会返回文本说明，不会触发桥接层的附件发送。
-
-`wechat-codex` 约定：当最终回复末尾包含 `wechat-attachments` 代码块时，会自动解析并发送附件。
-
-请在你的项目根目录新增（或补充）`AGENTS.md`，加入类似下面的规范：
-
-~~~markdown
-# WeChat Attachment Output Rules
-
-当你需要通过微信发送图片、文件、语音、视频时，在最终回复末尾追加如下代码块：
-
-```wechat-attachments
-image /absolute/path/to/image.png
-file /absolute/path/to/report.pdf
-voice /absolute/path/to/voice.mp3
-video /absolute/path/to/video.mp4
+```bash
+ffmpeg -version
+ffprobe -version
+whisper --help
 ```
 
-规则：
-1. 每行格式：`<type> <path>`
-2. `type` 仅支持：`image` / `file` / `voice` / `video`
-3. 路径优先使用绝对路径；相对路径会按当前工作目录解析
-4. 附件代码块必须放在最终回复末尾，且语法正确
-5. 若文件不存在，不要输出该附件行，先给出错误说明
-~~~
+## 2. 安装与初始化
 
-### 示例（模型输出）
-
-~~~text
-已生成周报，请查收。
-
-```wechat-attachments
-file /home/you/project/output/weekly-report.pdf
-```
-~~~
-
-### 验证是否生效
-
-1. 确认当前会话工作目录：微信发送 `/status`
-2. 确认该目录下有 `AGENTS.md`
-3. 让模型生成并发送一个已存在的测试文件
-4. 若未发送成功，检查：
-   - 附件块是否在最终回复末尾
-   - `type` 是否为 `image|file|voice|video`
-   - 路径是否存在且进程可读
-
-## 方式一：初始化向导（推荐）
-
-### 安装依赖并构建
+在项目目录执行：
 
 ```bash
 npm install
-```
-
-### 运行初始化
-
-```bash
 npm run setup
 ```
 
-初始化流程会完成：
+`npm run setup` 会做 3 件事：
 
-1. 微信扫码绑定账号
-2. 交互式设置默认工作目录（`workingDirectory`）
-3. 写入 `config.env`
+1. 弹出或打印微信二维码，让你扫码绑定
+2. 让你输入默认工作目录（Codex 在哪里工作）
+3. 写入配置文件 `~/.wechat-codex-bridge/config.env`
 
-### 启动服务
+## 3. 启动服务
 
 ```bash
 npm start
 ```
 
-## 方式二：手动编辑配置文件
+看到启动日志后，就可以去微信发消息测试。
 
-配置文件路径：`~/.wechat-codex-bridge/config.env`（或你自定义的 `WCB_DATA_DIR` 下同名文件）
+## 4. 如何使用
+
+### 4.1 最简单用法
+
+直接在微信里发一句话，比如：
+
+- “帮我写一个 Python 读取 CSV 的脚本”
+- “解释这段报错是什么意思”
+
+系统会自动把消息转给 Codex，并把回复发回微信。
+
+### 4.2 向Codex发送文件
+
+普通文件（例如 `.txt` / `.json` / `.geojson`）不是“发完立刻处理”，而是两步：
+
+1. 先把文件发给微信机器人（可连续发多个）
+2. 再发一条文字需求（例如“把这几个文件合并成一个 CSV 并统计条数”）
+
+### 4.3 让 Codex 把本地文件发回微信
+
+如果你希望 Codex 回传图片/文件/语音/视频，需要把下面的指令放入 ``` ~/.codex/AGENTS.md```   中。
+
+
+~~~markdown
+# WeChat Bridge Attachment Convention
+
+You may be running inside a `wechat-codex` bridge session, which mirrors your
+replies to a WeChat user. By default only your visible text is forwarded. To
+deliver a file to the WeChat user, append
+a fenced block at the very end of your final answer:
+
+```wechat-attachments
+image /abs/or/rel/path/to/picture.png
+file  /abs/or/rel/path/to/report.pdf
+voice /abs/or/rel/path/to/clip.mp3
+video /abs/or/rel/path/to/movie.mp4
+```
+
+## Rules
+
+- Place the block at the **very end** of the final answer, with a blank line
+  before it. No prose may follow the closing ``` fence.
+- One attachment per line. The first token is the `kind`; the rest is the path.
+- Valid kinds: `image`, `file`, `voice`, `video`.
+  - `image`: png, jpg/jpeg, gif, webp, bmp, svg
+  - `file`:  everything else — pdf, docx, xlsx, csv, txt, zip, json, logs, …
+  - `voice`: mp3, wav, m4a, ogg, aac
+  - `video`: mp4, mov, mkv, avi, webm
+- Use absolute paths when possible. Relative paths are resolved against the
+  current working directory.
+- Briefly mention in the visible prose what you are sending so the user has
+  context (e.g. "Here is the loss curve you asked for.").
+- The file must already exist on disk at the time you emit the block — the
+  bridge only forwards, it does not wait for files to appear. If you intend to
+  save then send, save first, then emit the block.
+- Include the block **only** when the user actually wants the artifact
+  delivered. Do not attach files by default.
+- **Never** include the fence inside a code example or inside prose — it is
+  parsed structurally and false positives will cause misdelivery. If you need
+  to discuss the convention itself, use inline code or indented blocks, not a
+  fenced block with the `wechat-attachments` info string.
+
+## Examples
+
+Single image:
+
+```
+Here is the requested chart.
+
+```wechat-attachments
+image /tmp/loss_curve.png
+```
+```
+
+Multiple files in one reply:
+
+```
+Attached: the training report and the raw metrics.
+
+```wechat-attachments
+file /home/user/proj/report.pdf
+file /home/user/proj/metrics.csv
+```
+```
+
+No attachment (normal reply — do not emit the block):
+
+```
+The experiment is still running; nothing to send yet.
+```
+```
+~~~
+
+
+## 5. 微信端常用命令
+
+- `/help`：查看帮助
+- `/status`：查看当前会话状态（工作目录、模型、模式、线程、剩余额度等）
+- `/cwd <路径>`：切换工作目录（会重启 Codex 会话）
+- `/model <模型名>`：切换模型
+- `/mode <plan|workspace|danger>`：切换运行模式（重启服务后生效）
+- `/now <内容>`：中断当前处理并立刻执行这条内容
+- `/clear`：清空当前会话
+- `/skills`：列出可用 skills
+
+## 6. 配置文件说明
+
+默认配置文件路径：
+
+- `~/.wechat-codex-bridge/config.env`
 
 示例：
 
@@ -190,42 +223,30 @@ mode=workspace
 
 字段说明：
 
-- `workingDirectory`：默认工作目录（必填，且必须存在）
-- `model`：会话默认模型（可选）
-- `mode`：运行模式（可选，默认 `workspace`）
-  - `plan`：只读分析模式
-  - `workspace`：工作区可写模式
-  - `danger`：无沙箱模式（高风险）
+- `workingDirectory`：默认工作目录（必填，必须存在）
+- `model`：默认模型（可选）
+- `mode`：运行模式（默认 `workspace`）
+  - `plan`：只读分析
+  - `workspace`：可写工作区（推荐）
+  - `danger`：无沙箱（高风险）
 
-> 注意：`mode` 影响 Codex 启动参数。修改后需要重启服务才生效。
-
-## 快速开始（最短路径）
+可通过环境变量修改数据目录：
 
 ```bash
-npm install
-npm run setup
-npm start
+export WCB_DATA_DIR=/your/path
 ```
 
-然后在微信里直接发消息即可。
+目录内会自动创建：
 
-## 常用微信命令
+- `config.env`
+- `logs/`
+- `tmp/`
 
-```text
-/help
-/status
-/cwd /path/to/workspace
-/model gpt-5.4
-/mode workspace
-/clear
-/skills
-```
+## 7. 常见问题
 
-## 常见问题
+### Q1: 启动时报“未找到账号”
 
-### 1) 启动时报 “未找到账号”
-
-先运行：
+先执行：
 
 ```bash
 npm run setup
@@ -233,9 +254,14 @@ npm run setup
 
 完成扫码绑定后再 `npm start`。
 
-### 2) 音视频无法处理
+### Q2: 提示工作目录不存在
 
-请检查以下命令是否可用：
+- 检查 `config.env` 的 `workingDirectory`
+- 或在微信发送 `/cwd <正确路径>`
+
+### Q3: 音频/视频一直处理失败
+
+检查这 3 个工具是否可用：
 
 ```bash
 ffmpeg -version
@@ -243,21 +269,16 @@ ffprobe -version
 whisper --help
 ```
 
-### 3) 工作目录报错（不存在或不是目录）
+### Q4: 改了 `/mode` 为什么没生效
 
-- 确认 `config.env` 里的 `workingDirectory` 合法
-- 或在微信中执行 `/cwd <目录>` 动态切换
+`/mode` 会写入会话设置，但要重启服务后才会按新模式启动 Codex：
 
-### 4) 微信上传文件后为什么不会立即调用 Codex？
+```bash
+npm start
+```
 
-这是当前设计：文件消息先保存到本地暂存目录，微信会提示你“请输入对文件的处理需求”。
+## 8. 安全建议
 
-- 你可以连续发送多个文件，系统会累计等待
-- 当你再发一条文字需求时，系统会把“需求 + 所有待处理文件路径”一次性发给 Codex
-- 这样可以避免把文件原始内容误粘贴到 TUI 输入框，也避免“需要手动按 Enter 才发送”的问题
-
-## 安全建议
-
-- `danger` 模式会以无沙箱方式执行本机 Codex，请仅在可信环境下使用
-- 建议把桥接服务放在最小权限账号下运行
-- 定期清理数据目录中的历史日志与临时文件
+- 除非你非常确定环境可信，否则不要用 `danger` 模式
+- 建议使用最小权限账号运行服务
+- 定期清理 `~/.wechat-codex-bridge/tmp` 和日志文件

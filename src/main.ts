@@ -416,12 +416,20 @@ async function runDaemon(): Promise<void> {
     onWechatAttachment: (attachment) => {
       void sendAttachmentToWechat(attachment);
     },
-    onWechatTurnComplete: () => {
-      session.state = 'idle';
-      sessionStore.save(account.accountId, session);
-      cleanupTempFiles(activeTempFiles);
-      activeTempFiles = [];
+    onTurnFinalized: () => {
+      if (activeTempFiles.length > 0 || session.state !== 'idle') {
+        session.state = 'idle';
+        sessionStore.save(account.accountId, session);
+      }
+      if (activeTempFiles.length > 0) {
+        cleanupTempFiles(activeTempFiles);
+        activeTempFiles = [];
+      }
       processNextQueued();
+    },
+    onWechatTurnComplete: () => {
+      // Legacy hook retained for compatibility; queue progression and cleanup
+      // are handled in onTurnFinalized to cover all completion paths.
     },
     onError: (msg) => logger.error('Bridge error', { error: msg }),
     onExit: (code) => {
