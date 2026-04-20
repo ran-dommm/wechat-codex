@@ -1,7 +1,7 @@
 # wechat-codex
 
 把微信变成 Codex 的聊天入口。  
-你在微信里发消息（文字、图片、语音、音视频、文件），`wechat-codex` 会把内容转给本机 Codex，再把结果回传到微信。
+你在微信里发消息（文字、图片、语音、音视频、文件），`wechat-codex` 会把内容转给本机 Codex，再把结果回传到微信。实现基于ClawBot。
 
 
 ## 这个项目能做什么
@@ -41,22 +41,10 @@ nvm install 22
 nvm use 22
 ```
 
-安装 OpenClaw：
-
-```bash
-npm install -g openclaw@latest
-```
-
 安装 Codex CLI：
 
 ```bash
 npm install -g @openai/codex@latest
-```
-
-安装 Clawbot：
-
-```bash
-npx -y @tencent-weixin/openclaw-weixin-cli@latest install
 ```
 
 安装后检查：
@@ -65,8 +53,6 @@ npx -y @tencent-weixin/openclaw-weixin-cli@latest install
 node -v
 npm -v
 codex --help
-openclaw --help
-clawbot --help
 ```
 
 ### 1.2 可选（未测试）
@@ -100,8 +86,6 @@ npm run setup
 npm start
 ```
 
-看到启动日志后，就可以去微信发消息测试。
-
 ## 4. 如何使用
 
 ### 4.1 最简单用法
@@ -111,7 +95,7 @@ npm start
 - “帮我写一个 Python 读取 CSV 的脚本”
 - “解释这段报错是什么意思”
 
-系统会自动把消息转给 Codex，并把回复发回微信。
+系统会自动把消息转给 Codex，并把中间思考内容和回复发回微信。
 
 ### 4.2 向Codex发送文件
 
