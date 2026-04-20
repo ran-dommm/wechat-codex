@@ -15,6 +15,7 @@ export interface CommandResult {
   reply?: string;
   handled: boolean;
   codexPrompt?: string; // If set, this text should be sent to Codex
+  nowPrompt?: string; // If set, interrupt current work and run this immediately
 }
 
 /**
@@ -27,6 +28,7 @@ export interface CommandResult {
  *   /cwd <path> - Update the working directory
  *   /mode <mode> - Update execution mode
  *   /status   - Show current session info
+ *   /now <text> - Interrupt current turn, clear queue, and run text now
  *   /skills   - List all installed skills
  *   /<skill>  - Invoke a skill by name (args are forwarded to Claude)
  */
@@ -58,6 +60,11 @@ export function routeCommand(ctx: CommandContext): CommandResult {
       return handlePermissionAlias();
     case 'status':
       return handleStatus(ctx);
+    case 'now':
+      return {
+        handled: true,
+        nowPrompt: args,
+      };
     case 'skills':
       return handleSkills();
     default:

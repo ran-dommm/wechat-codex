@@ -12,6 +12,7 @@ const HELP_TEXT = `可用命令：
   /cwd <路径>       切换工作目录
   /mode <模式>      切换执行模式
   /status           查看当前会话状态
+  /now <内容>       中断当前回合并清空排队，立即执行内容
   /skills           列出已安装的 skills
   /<skill> [参数]   触发已安装的 skill
 

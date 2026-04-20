@@ -20,21 +20,32 @@ export interface WechatAttachment {
 export interface NativeBridgeEvents {
   onWechatReply: (text: string) => void;
   onWechatAttachment: (attachment: WechatAttachment) => void;
-  onInteractiveConfirmation: (prompt: string) => void;
   onWechatTurnComplete: () => void;
   onError: (message: string) => void;
   onExit: (code: number | null) => void;
 }
 
+export interface CodexRateLimitWindow {
+  usedPercent: number;
+  windowMinutes?: number;
+  resetsAt?: number;
+}
+
+export interface CodexRateLimitsSnapshot {
+  planType?: string;
+  primary?: CodexRateLimitWindow;
+  secondary?: CodexRateLimitWindow;
+}
+
 function buildCodexArgs(mode: CodexSpawnMode): string[] {
   switch (mode) {
     case 'plan':
-      return ['-s', 'read-only', '-c', 'approval_policy="on-request"'];
+      return ['-s', 'read-only', '-c', 'approval_policy="never"'];
     case 'danger':
       return ['--dangerously-bypass-approvals-and-sandbox'];
     case 'workspace':
     default:
-      return ['-s', 'workspace-write', '-c', 'approval_policy="on-request"'];
+      return ['-s', 'workspace-write', '-c', 'approval_policy="never"'];
   }
 }
 
@@ -66,9 +77,7 @@ export class NativeCodexBridge {
   // a `user_message` event. When we see a user_message matching this, we know
   // the turn is WeChat-sourced; anything else is terminal.
   private pendingWechatInjection: string | null = null;
-  private pendingInteractiveInputEcho: string | null = null;
-  private awaitingConfirmation = false;
-  private ttyTail = '';
+  private latestRateLimits: CodexRateLimitsSnapshot | null = null;
 
   private shuttingDown = false;
   private originalRawMode: boolean | null = null;
@@ -98,21 +107,26 @@ export class NativeCodexBridge {
     return this.threadId;
   }
 
-  get isAwaitingConfirmation(): boolean {
-    return this.awaitingConfirmation;
-  }
-
   setCwd(cwd: string): void {
     this.cwd = cwd;
   }
 
-  submitInteractiveConfirmation(answer: 'y' | 'n'): boolean {
-    if (!this.ptyProc || !this.awaitingConfirmation) return false;
-    this.awaitingConfirmation = false;
-    this.pendingInteractiveInputEcho = answer;
-    this.ptyProc.write(answer);
-    this.ptyProc.write('\r');
-    return true;
+  getLatestRateLimits(): CodexRateLimitsSnapshot | null {
+    return this.latestRateLimits;
+  }
+
+  interruptAndClearQueue(): { interrupted: boolean; clearedQueued: number } {
+    const clearedQueued = this.wechatQueue.length;
+    this.wechatQueue = [];
+    this.pendingWechatInjection = null;
+
+    if (!this.ptyProc) {
+      return { interrupted: false, clearedQueued };
+    }
+
+    // Send Ctrl-C to interrupt the current foreground action in the TUI.
+    this.ptyProc.write('\x03');
+    return { interrupted: true, clearedQueued };
   }
 
   async start(): Promise<void> {
@@ -138,7 +152,6 @@ export class NativeCodexBridge {
 
     child.onData((data) => {
       if (myGen !== this.generation) return;
-      this.inspectInteractiveConfirmationPrompt(data);
       process.stdout.write(data);
     });
 
@@ -177,9 +190,7 @@ export class NativeCodexBridge {
     this.threadId = null;
     this.activeTurn = null;
     this.pendingWechatInjection = null;
-    this.pendingInteractiveInputEcho = null;
-    this.awaitingConfirmation = false;
-    this.ttyTail = '';
+    this.latestRateLimits = null;
     this.wechatQueue = [];
 
     const old = this.ptyProc;
@@ -378,6 +389,14 @@ export class NativeCodexBridge {
 
     const payloadType = payload.type;
 
+    if (payloadType === 'token_count') {
+      const parsed = parseRateLimitsFromTokenCountPayload(payload);
+      if (parsed) {
+        this.latestRateLimits = parsed;
+      }
+      return;
+    }
+
     if (payloadType === 'task_started') {
       const turnId = typeof payload.turn_id === 'string' ? payload.turn_id : null;
       // Source is unknown until we see the matching user_message. Attributing
@@ -403,13 +422,6 @@ export class NativeCodexBridge {
         this.activeTurn.source = 'wechat';
         this.pendingWechatInjection = null;
       } else {
-        if (
-          this.pendingInteractiveInputEcho !== null &&
-          textsMatch(message, this.pendingInteractiveInputEcho)
-        ) {
-          this.pendingInteractiveInputEcho = null;
-          return;
-        }
         this.activeTurn.source = 'terminal';
         if (message.trim()) {
           this.events.onWechatReply(`⌨️ 终端输入：${message}`);
@@ -449,9 +461,6 @@ export class NativeCodexBridge {
   private completeActiveTurn(reason: 'complete' | 'aborted'): void {
     const turn = this.activeTurn;
     this.activeTurn = null;
-    this.awaitingConfirmation = false;
-    this.pendingInteractiveInputEcho = null;
-    this.ttyTail = '';
 
     if (!turn) {
       this.maybeDispatchQueued();
@@ -484,37 +493,12 @@ export class NativeCodexBridge {
 
     this.maybeDispatchQueued();
   }
-
-  private inspectInteractiveConfirmationPrompt(data: string): void {
-    const stripped = stripAnsi(data).replace(/\r/g, '\n');
-    this.ttyTail = (this.ttyTail + stripped).slice(-4000);
-    if (this.awaitingConfirmation) return;
-
-    const recent = this.ttyTail.split('\n').slice(-6).join(' ').replace(/\s+/g, ' ').trim();
-    if (!recent) return;
-    if (!isLikelyConfirmationPrompt(recent)) return;
-
-    this.awaitingConfirmation = true;
-    const prompt = recent.length > 260 ? `...${recent.slice(-260)}` : recent;
-    this.events.onInteractiveConfirmation(prompt);
-  }
 }
 
 // ── Helpers ──
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function stripAnsi(input: string): string {
-  return input.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '');
-}
-
-function isLikelyConfirmationPrompt(text: string): boolean {
-  const yn = /[\(\[]\s*y\s*\/\s*n\s*[\)\]]/i;
-  if (!yn.test(text)) return false;
-  const intent = /(approve|approval|confirm|run|execute|allow|permission|continue|danger|sandbox|command|tool|操作|确认|同意|允许|执行)/i;
-  return intent.test(text);
 }
 
 // Compare two user-message texts loosely: whitespace-normalised and trimmed.
@@ -582,6 +566,40 @@ function buildEnv(): Record<string, string> {
   }
   env.TERM = env.TERM || 'xterm-256color';
   return env;
+}
+
+function parseRateLimitsFromTokenCountPayload(payload: Record<string, unknown>): CodexRateLimitsSnapshot | null {
+  const info = asRecord(payload.info);
+  const rateLimits = asRecord(info?.rate_limits) ?? asRecord(payload.rate_limits);
+  if (!rateLimits) return null;
+
+  const primary = parseRateLimitWindow(asRecord(rateLimits.primary));
+  const secondary = parseRateLimitWindow(asRecord(rateLimits.secondary));
+  const planType = typeof rateLimits.plan_type === 'string' ? rateLimits.plan_type : undefined;
+
+  if (!primary && !secondary && !planType) return null;
+  return {
+    planType,
+    primary: primary ?? undefined,
+    secondary: secondary ?? undefined,
+  };
+}
+
+function parseRateLimitWindow(input: Record<string, unknown> | null): CodexRateLimitWindow | null {
+  if (!input) return null;
+  const usedPercentRaw = input.used_percent;
+  if (typeof usedPercentRaw !== 'number' || Number.isNaN(usedPercentRaw)) return null;
+  const windowMinutes = typeof input.window_minutes === 'number' ? input.window_minutes : undefined;
+  const resetsAt = typeof input.resets_at === 'number' ? input.resets_at : undefined;
+  return {
+    usedPercent: usedPercentRaw,
+    windowMinutes,
+    resetsAt,
+  };
+}
+
+function asRecord(v: unknown): Record<string, unknown> | null {
+  return v && typeof v === 'object' ? (v as Record<string, unknown>) : null;
 }
 
 interface SessionCandidate {

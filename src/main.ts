@@ -137,12 +137,40 @@ function extractSlashCommandName(text: string): string | null {
   return cmd ? cmd.toLowerCase() : null;
 }
 
-function parseConfirmationReply(text: string): 'y' | 'n' | null {
-  const normalized = text.trim().toLowerCase();
-  if (!normalized) return null;
-  if (['y', 'yes', 'ok', '同意', '确认', '允许'].includes(normalized)) return 'y';
-  if (['n', 'no', '取消', '拒绝', '不同意'].includes(normalized)) return 'n';
-  return null;
+function formatResetAtTimestamp(epochSeconds?: number): string {
+  if (!epochSeconds || !Number.isFinite(epochSeconds)) return '未知';
+  const ts = epochSeconds * 1000;
+  if (!Number.isFinite(ts)) return '未知';
+  return new Date(ts).toLocaleString('zh-CN', { hour12: false });
+}
+
+function formatRateLimitLine(label: string, usedPercent: number, windowMinutes?: number, resetsAt?: number): string {
+  const remaining = Math.max(0, 100 - usedPercent);
+  const windowText = typeof windowMinutes === 'number' ? `${windowMinutes} 分钟窗口` : '窗口未知';
+  const usedText = usedPercent.toFixed(1);
+  const remainText = remaining.toFixed(1);
+  return `${label}: 已用 ${usedText}% / 剩余 ${remainText}% (${windowText}, 重置: ${formatResetAtTimestamp(resetsAt)})`;
+}
+
+function formatQuotaStatusLines(snapshot: ReturnType<NativeCodexBridge['getLatestRateLimits']>): string[] {
+  if (!snapshot) {
+    return ['Codex 剩余额度: 暂无数据（等待 Codex 产生 token_count 事件后更新）'];
+  }
+
+  const lines = ['Codex 剩余额度:'];
+  if (snapshot.planType) {
+    lines.push(`套餐: ${snapshot.planType}`);
+  }
+  if (snapshot.primary) {
+    lines.push(formatRateLimitLine('主额度', snapshot.primary.usedPercent, snapshot.primary.windowMinutes, snapshot.primary.resetsAt));
+  }
+  if (snapshot.secondary) {
+    lines.push(formatRateLimitLine('次额度', snapshot.secondary.usedPercent, snapshot.secondary.windowMinutes, snapshot.secondary.resetsAt));
+  }
+  if (!snapshot.primary && !snapshot.secondary) {
+    lines.push('暂无窗口数据');
+  }
+  return lines;
 }
 
 function ensureUsableDirectory(cwd: string): void {
@@ -372,6 +400,12 @@ async function runDaemon(): Promise<void> {
     }
   }
 
+  function clearQueuedMessages(accountId: string): number {
+    const count = queuedMessages.get(accountId)?.length ?? 0;
+    queuedMessages.delete(accountId);
+    return count;
+  }
+
   // ── Native Codex Bridge ──
 
   const mode = (session.mode ?? config.mode ?? 'workspace') as 'plan' | 'workspace' | 'danger';
@@ -381,13 +415,6 @@ async function runDaemon(): Promise<void> {
     },
     onWechatAttachment: (attachment) => {
       void sendAttachmentToWechat(attachment);
-    },
-    onInteractiveConfirmation: (prompt) => {
-      const lines = [
-        '⚠️ Codex 正在等待确认，请回复 y 或 n。',
-        `提示: ${prompt}`,
-      ];
-      void sendTextToWechat(lines.join('\n'));
     },
     onWechatTurnComplete: () => {
       session.state = 'idle';
@@ -416,7 +443,6 @@ async function runDaemon(): Promise<void> {
       const userText = extractTextFromItems(msg.item_list);
       const media = extractFirstSupportedMedia(msg.item_list);
       const isSlashCommand = userText.startsWith('/');
-      const confirmationReply = parseConfirmationReply(userText);
 
       lastRecipient = { userId: fromUserId, contextToken };
 
@@ -446,6 +472,30 @@ async function runDaemon(): Promise<void> {
         };
 
         const result: CommandResult = routeCommand(ctx);
+        if (result.nowPrompt !== undefined) {
+          const droppedExternal = clearQueuedMessages(account.accountId);
+          const { interrupted, clearedQueued: droppedBridge } = bridge.interruptAndClearQueue();
+          const prompt = result.nowPrompt.trim();
+          const droppedTotal = droppedExternal + droppedBridge;
+
+          if (!prompt) {
+            const lines = [
+              interrupted ? '⛔ 已发送中断信号。' : '⚠️ 当前无可中断的会话进程。',
+              `🧹 已清空排队消息 ${droppedTotal} 条。`,
+              '用法: /now <你要立刻执行的内容>',
+            ];
+            await sender.sendText(fromUserId, contextToken, lines.join('\n'));
+            return;
+          }
+
+          await sender.sendText(
+            fromUserId,
+            contextToken,
+            `⚡ 已中断并清空排队 ${droppedTotal} 条，正在立即执行 /now 请求。`,
+          );
+          void sendWechatMessageToCodex(prompt, undefined, fromUserId, contextToken);
+          return;
+        }
         if (result.reply) {
           if (slashCommand === 'cwd' && session.workingDirectory) {
             try {
@@ -460,6 +510,11 @@ async function runDaemon(): Promise<void> {
               );
               return;
             }
+          }
+          if (slashCommand === 'status') {
+            const quotaLines = formatQuotaStatusLines(bridge.getLatestRateLimits());
+            await sender.sendText(fromUserId, contextToken, `${result.reply}\n\n${quotaLines.join('\n')}`);
+            return;
           }
           await sender.sendText(fromUserId, contextToken, result.reply);
           return;
@@ -518,24 +573,6 @@ async function runDaemon(): Promise<void> {
 
       // Queue if busy
       if (bridge.isBusy) {
-        if (bridge.isAwaitingConfirmation) {
-          if (media) {
-            await sender.sendText(fromUserId, contextToken, '⚠️ 当前正在等待确认，请先回复 y 或 n。');
-            return;
-          }
-          if (confirmationReply) {
-            const sent = bridge.submitInteractiveConfirmation(confirmationReply);
-            if (!sent) {
-              await sender.sendText(fromUserId, contextToken, '⚠️ 确认状态已变化，请稍后重试。');
-              return;
-            }
-            await sender.sendText(fromUserId, contextToken, `✅ 已提交确认：${confirmationReply}`);
-            return;
-          }
-          await sender.sendText(fromUserId, contextToken, '⚠️ 当前正在等待确认，请回复 y 或 n（也支持 yes/no、同意/拒绝）。');
-          return;
-        }
-
         if (!isSlashCommand && (userText || media)) {
           const queueLength = enqueueQueuedMessage(queuedMessages, account.accountId, {
             userText,
@@ -579,10 +616,9 @@ async function runDaemon(): Promise<void> {
 
   const modeDesc = mode === 'plan' ? 'plan (read-only)'
     : mode === 'danger' ? 'danger (no sandbox)'
-    : 'workspace (writable sandbox, interactive approvals)';
+    : 'workspace (writable sandbox, auto-approve off)';
   console.log(`[wechat-codex] Starting native Codex TUI (cwd: ${cwd})`);
-  const approvalPolicy = mode === 'danger' ? 'bypass' : 'on-request';
-  console.log(`[wechat-codex] Mode: ${modeDesc}  |  approval_policy: ${approvalPolicy}`);
+  console.log(`[wechat-codex] Mode: ${modeDesc}  |  approval_policy: never`);
   console.log('[wechat-codex] WeChat messages will be forwarded to Codex automatically.\n');
 
   await bridge.start();
