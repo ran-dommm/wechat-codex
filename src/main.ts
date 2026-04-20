@@ -129,6 +129,22 @@ function extractTextFromItems(items: NonNullable<WeixinMessage['item_list']>): s
   return items.map((item) => extractText(item)).filter(Boolean).join('\n');
 }
 
+function extractSlashCommandName(text: string): string | null {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('/')) return null;
+  const spaceIdx = trimmed.indexOf(' ');
+  const cmd = (spaceIdx === -1 ? trimmed.slice(1) : trimmed.slice(1, spaceIdx)).trim();
+  return cmd ? cmd.toLowerCase() : null;
+}
+
+function parseConfirmationReply(text: string): 'y' | 'n' | null {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return null;
+  if (['y', 'yes', 'ok', '同意', '确认', '允许'].includes(normalized)) return 'y';
+  if (['n', 'no', '取消', '拒绝', '不同意'].includes(normalized)) return 'n';
+  return null;
+}
+
 function ensureUsableDirectory(cwd: string): void {
   if (!existsSync(cwd)) {
     throw new Error(`工作目录不存在: ${cwd}`);
@@ -366,6 +382,13 @@ async function runDaemon(): Promise<void> {
     onWechatAttachment: (attachment) => {
       void sendAttachmentToWechat(attachment);
     },
+    onInteractiveConfirmation: (prompt) => {
+      const lines = [
+        '⚠️ Codex 正在等待确认，请回复 y 或 n。',
+        `提示: ${prompt}`,
+      ];
+      void sendTextToWechat(lines.join('\n'));
+    },
     onWechatTurnComplete: () => {
       session.state = 'idle';
       sessionStore.save(account.accountId, session);
@@ -393,11 +416,13 @@ async function runDaemon(): Promise<void> {
       const userText = extractTextFromItems(msg.item_list);
       const media = extractFirstSupportedMedia(msg.item_list);
       const isSlashCommand = userText.startsWith('/');
+      const confirmationReply = parseConfirmationReply(userText);
 
       lastRecipient = { userId: fromUserId, contextToken };
 
       // Handle slash commands (work even when busy)
       if (isSlashCommand) {
+        const slashCommand = extractSlashCommandName(userText);
         const updateSession = (partial: Partial<Session>) => {
           Object.assign(session, partial);
           sessionStore.save(account.accountId, session);
@@ -422,6 +447,20 @@ async function runDaemon(): Promise<void> {
 
         const result: CommandResult = routeCommand(ctx);
         if (result.reply) {
+          if (slashCommand === 'cwd' && session.workingDirectory) {
+            try {
+              await bridge.restart(session.workingDirectory);
+            } catch (err) {
+              const errMsg = err instanceof Error ? err.message : String(err);
+              logger.error('Failed to restart bridge after /cwd', { error: errMsg });
+              await sender.sendText(
+                fromUserId,
+                contextToken,
+                `⚠️ 工作目录已记录，但重启 Codex 失败：${errMsg.slice(0, 200)}`,
+              );
+              return;
+            }
+          }
           await sender.sendText(fromUserId, contextToken, result.reply);
           return;
         }
@@ -479,6 +518,24 @@ async function runDaemon(): Promise<void> {
 
       // Queue if busy
       if (bridge.isBusy) {
+        if (bridge.isAwaitingConfirmation) {
+          if (media) {
+            await sender.sendText(fromUserId, contextToken, '⚠️ 当前正在等待确认，请先回复 y 或 n。');
+            return;
+          }
+          if (confirmationReply) {
+            const sent = bridge.submitInteractiveConfirmation(confirmationReply);
+            if (!sent) {
+              await sender.sendText(fromUserId, contextToken, '⚠️ 确认状态已变化，请稍后重试。');
+              return;
+            }
+            await sender.sendText(fromUserId, contextToken, `✅ 已提交确认：${confirmationReply}`);
+            return;
+          }
+          await sender.sendText(fromUserId, contextToken, '⚠️ 当前正在等待确认，请回复 y 或 n（也支持 yes/no、同意/拒绝）。');
+          return;
+        }
+
         if (!isSlashCommand && (userText || media)) {
           const queueLength = enqueueQueuedMessage(queuedMessages, account.accountId, {
             userText,
@@ -522,9 +579,10 @@ async function runDaemon(): Promise<void> {
 
   const modeDesc = mode === 'plan' ? 'plan (read-only)'
     : mode === 'danger' ? 'danger (no sandbox)'
-    : 'workspace (writable sandbox, auto-approve off)';
+    : 'workspace (writable sandbox, interactive approvals)';
   console.log(`[wechat-codex] Starting native Codex TUI (cwd: ${cwd})`);
-  console.log(`[wechat-codex] Mode: ${modeDesc}  |  approval_policy: never`);
+  const approvalPolicy = mode === 'danger' ? 'bypass' : 'on-request';
+  console.log(`[wechat-codex] Mode: ${modeDesc}  |  approval_policy: ${approvalPolicy}`);
   console.log('[wechat-codex] WeChat messages will be forwarded to Codex automatically.\n');
 
   await bridge.start();

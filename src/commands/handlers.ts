@@ -76,7 +76,10 @@ export function handleCwd(ctx: CommandContext, args: string): CommandResult {
     return { reply: `不是目录: ${nextPath}`, handled: true };
   }
   ctx.updateSession({ workingDirectory: nextPath, threadId: undefined });
-  return { reply: `✅ 工作目录已切换为: ${nextPath}\n已重置会话线程，新目录会在下一条请求生效。`, handled: true };
+  return {
+    reply: `✅ 工作目录已切换为: ${nextPath}\n正在重启 Codex 会话以应用新目录与沙箱范围，请稍候。`,
+    handled: true,
+  };
 }
 
 const MODE_DESCRIPTIONS: Record<string, string> = {

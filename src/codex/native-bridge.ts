@@ -20,6 +20,7 @@ export interface WechatAttachment {
 export interface NativeBridgeEvents {
   onWechatReply: (text: string) => void;
   onWechatAttachment: (attachment: WechatAttachment) => void;
+  onInteractiveConfirmation: (prompt: string) => void;
   onWechatTurnComplete: () => void;
   onError: (message: string) => void;
   onExit: (code: number | null) => void;
@@ -28,12 +29,12 @@ export interface NativeBridgeEvents {
 function buildCodexArgs(mode: CodexSpawnMode): string[] {
   switch (mode) {
     case 'plan':
-      return ['-s', 'read-only', '-c', 'approval_policy="never"'];
+      return ['-s', 'read-only', '-c', 'approval_policy="on-request"'];
     case 'danger':
       return ['--dangerously-bypass-approvals-and-sandbox'];
     case 'workspace':
     default:
-      return ['-s', 'workspace-write', '-c', 'approval_policy="never"'];
+      return ['-s', 'workspace-write', '-c', 'approval_policy="on-request"'];
   }
 }
 
@@ -65,9 +66,19 @@ export class NativeCodexBridge {
   // a `user_message` event. When we see a user_message matching this, we know
   // the turn is WeChat-sourced; anything else is terminal.
   private pendingWechatInjection: string | null = null;
+  private pendingInteractiveInputEcho: string | null = null;
+  private awaitingConfirmation = false;
+  private ttyTail = '';
 
   private shuttingDown = false;
   private originalRawMode: boolean | null = null;
+
+  // Monotonically increasing generation counter for the underlying Codex PTY
+  // process. Every launch bumps this. Per-launch callbacks capture their
+  // generation and bail if it no longer matches, so we can kill+respawn
+  // without triggering the top-level onExit (which shuts the daemon down).
+  private generation = 0;
+  private restarting: Promise<void> | null = null;
 
   constructor(
     private cwd: string,
@@ -87,12 +98,33 @@ export class NativeCodexBridge {
     return this.threadId;
   }
 
+  get isAwaitingConfirmation(): boolean {
+    return this.awaitingConfirmation;
+  }
+
   setCwd(cwd: string): void {
     this.cwd = cwd;
   }
 
+  submitInteractiveConfirmation(answer: 'y' | 'n'): boolean {
+    if (!this.ptyProc || !this.awaitingConfirmation) return false;
+    this.awaitingConfirmation = false;
+    this.pendingInteractiveInputEcho = answer;
+    this.ptyProc.write(answer);
+    this.ptyProc.write('\r');
+    return true;
+  }
+
   async start(): Promise<void> {
+    this.launchCodex();
+    this.startForwardingStdin();
+    this.handleResize();
+    process.stdout.on('resize', this.handleResize);
+  }
+
+  private launchCodex(): void {
     this.sessionStartedAtMs = Date.now();
+    const myGen = ++this.generation;
 
     const child = pty.spawn('codex', buildCodexArgs(this.mode), {
       name: 'xterm-256color',
@@ -105,22 +137,61 @@ export class NativeCodexBridge {
     this.ptyProc = child;
 
     child.onData((data) => {
+      if (myGen !== this.generation) return;
+      this.inspectInteractiveConfirmationPrompt(data);
       process.stdout.write(data);
     });
 
     child.onExit(({ exitCode }) => {
-      this.stopForwardingStdin();
-      this.stopPolling();
+      if (myGen !== this.generation) return;
+      // Keep stdin forwarding active while daemon is alive. Stop it only on
+      // process shutdown; otherwise /cwd restarts would break terminal input.
       if (!this.shuttingDown) {
         this.events.onExit(exitCode ?? null);
       }
     });
 
-    this.startForwardingStdin();
-    this.handleResize();
-    process.stdout.on('resize', this.handleResize);
-
     this.startPolling();
+  }
+
+  async restart(newCwd?: string): Promise<void> {
+    if (this.restarting) {
+      await this.restarting;
+    }
+    this.restarting = this.doRestart(newCwd);
+    try {
+      await this.restarting;
+    } finally {
+      this.restarting = null;
+    }
+  }
+
+  private async doRestart(newCwd?: string): Promise<void> {
+    if (newCwd) this.cwd = newCwd;
+
+    this.stopPolling();
+    this.sessionFilePath = null;
+    this.sessionReadOffset = 0;
+    this.sessionPartialLine = '';
+    this.sessionStartedAtMs = Date.now();
+    this.threadId = null;
+    this.activeTurn = null;
+    this.pendingWechatInjection = null;
+    this.pendingInteractiveInputEcho = null;
+    this.awaitingConfirmation = false;
+    this.ttyTail = '';
+    this.wechatQueue = [];
+
+    const old = this.ptyProc;
+    this.ptyProc = null;
+    // Mark existing process callbacks stale before killing.
+    this.generation++;
+    if (old) {
+      try { old.kill(); } catch { /* best effort */ }
+    }
+
+    await delay(200);
+    this.launchCodex();
   }
 
   async stop(): Promise<void> {
@@ -332,6 +403,13 @@ export class NativeCodexBridge {
         this.activeTurn.source = 'wechat';
         this.pendingWechatInjection = null;
       } else {
+        if (
+          this.pendingInteractiveInputEcho !== null &&
+          textsMatch(message, this.pendingInteractiveInputEcho)
+        ) {
+          this.pendingInteractiveInputEcho = null;
+          return;
+        }
         this.activeTurn.source = 'terminal';
         if (message.trim()) {
           this.events.onWechatReply(`⌨️ 终端输入：${message}`);
@@ -371,6 +449,9 @@ export class NativeCodexBridge {
   private completeActiveTurn(reason: 'complete' | 'aborted'): void {
     const turn = this.activeTurn;
     this.activeTurn = null;
+    this.awaitingConfirmation = false;
+    this.pendingInteractiveInputEcho = null;
+    this.ttyTail = '';
 
     if (!turn) {
       this.maybeDispatchQueued();
@@ -403,12 +484,37 @@ export class NativeCodexBridge {
 
     this.maybeDispatchQueued();
   }
+
+  private inspectInteractiveConfirmationPrompt(data: string): void {
+    const stripped = stripAnsi(data).replace(/\r/g, '\n');
+    this.ttyTail = (this.ttyTail + stripped).slice(-4000);
+    if (this.awaitingConfirmation) return;
+
+    const recent = this.ttyTail.split('\n').slice(-6).join(' ').replace(/\s+/g, ' ').trim();
+    if (!recent) return;
+    if (!isLikelyConfirmationPrompt(recent)) return;
+
+    this.awaitingConfirmation = true;
+    const prompt = recent.length > 260 ? `...${recent.slice(-260)}` : recent;
+    this.events.onInteractiveConfirmation(prompt);
+  }
 }
 
 // ── Helpers ──
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function stripAnsi(input: string): string {
+  return input.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '');
+}
+
+function isLikelyConfirmationPrompt(text: string): boolean {
+  const yn = /[\(\[]\s*y\s*\/\s*n\s*[\)\]]/i;
+  if (!yn.test(text)) return false;
+  const intent = /(approve|approval|confirm|run|execute|allow|permission|continue|danger|sandbox|command|tool|操作|确认|同意|允许|执行)/i;
+  return intent.test(text);
 }
 
 // Compare two user-message texts loosely: whitespace-normalised and trimmed.
