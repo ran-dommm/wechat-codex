@@ -20,3 +20,8 @@ Thumbs.db
 *.swo
 
 *.tsbuildinfo
+
+# Local/private Codex workspace artifacts
+docs/
+.codex-skills/
+expose-6767-forwarder.mjs

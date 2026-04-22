@@ -13,6 +13,10 @@ const HELP_TEXT = `可用命令：
   /mode <模式>      切换执行模式
   /status           查看当前会话状态
   /now <内容>       中断当前回合并清空排队，立即执行内容
+  /allow            向 Codex TUI 发送 Enter，用于权限确认
+  /deny             向 Codex TUI 发送 Esc，用于取消权限确认
+  /key <按键>       向 Codex TUI 发送按键
+  /screen           查看当前 Codex TUI 界面
   /skills           列出已安装的 skills
   /<skill> [参数]   触发已安装的 skill
 
@@ -120,7 +124,14 @@ export function handleMode(ctx: CommandContext, args: string): CommandResult {
 export function handlePermissionAlias(): CommandResult {
   return {
     handled: true,
-    reply: 'Codex bridge 不支持 Claude SDK 那种逐工具权限回调。请使用 /mode plan|workspace|danger 控制执行级别。',
+    reply: [
+      'Codex 权限确认是原生 TUI 里的交互，不是普通聊天消息。',
+      '可用命令：',
+      '  /allow  发送 Enter，执行当前选中的选项',
+      '  /deny   发送 Esc，取消/返回',
+      '  /key <enter|esc|up|down|left|right|tab|space|y|p|n|1|2|3>  发送指定按键',
+      '  /screen 查看当前 Codex TUI 界面和可选项',
+    ].join('\n'),
   };
 }
 

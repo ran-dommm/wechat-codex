@@ -6,6 +6,8 @@ export interface Config {
   workingDirectory: string;
   model?: string;
   mode?: "plan" | "workspace" | "danger";
+  codexProxyMode?: "inherit" | "clear";
+  wechatProxyUrl?: string;
 }
 
 const CONFIG_DIR = DATA_DIR;
@@ -42,6 +44,16 @@ function parseConfigFile(content: string): Config {
           config.mode = value;
         }
         break;
+      case "codexProxyMode":
+        if (value === "inherit" || value === "clear") {
+          config.codexProxyMode = value;
+        }
+        break;
+      case "wechatProxyUrl":
+        if (value) {
+          config.wechatProxyUrl = value;
+        }
+        break;
     }
   }
   return config;
@@ -65,6 +77,12 @@ export function saveConfig(config: Config): void {
   }
   if (config.mode) {
     lines.push(`mode=${config.mode}`);
+  }
+  if (config.codexProxyMode) {
+    lines.push(`codexProxyMode=${config.codexProxyMode}`);
+  }
+  if (config.wechatProxyUrl) {
+    lines.push(`wechatProxyUrl=${config.wechatProxyUrl}`);
   }
   writeFileSync(CONFIG_PATH, lines.join("\n") + "\n", "utf-8");
   if (process.platform !== 'win32') {

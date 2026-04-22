@@ -188,8 +188,27 @@ The experiment is still running; nothing to send yet.
 - `/model <模型名>`：切换模型
 - `/mode <plan|workspace|danger>`：切换运行模式（重启服务后生效）
 - `/now <内容>`：中断当前处理并立刻执行这条内容
+- `/allow`：向 Codex TUI 发送 Enter，用于权限确认
+- `/deny`：向 Codex TUI 发送 Esc，用于取消权限确认
+- `/key <enter|esc|up|down|left|right|tab|space|y|p|n|1|2|3>`：向 Codex TUI 发送指定按键
+- `/screen`：查看当前 Codex TUI 界面和可选项
 - `/clear`：清空当前会话
 - `/skills`：列出可用 skills
+
+### 在微信里处理 Codex 权限确认
+
+wechat-codex 运行的是原生 Codex TUI。遇到需要权限确认的命令时，Codex 会在 TUI 里显示选项，wechat-codex 会把当前界面同步到微信。常用操作：
+
+```text
+/screen        查看当前 Codex TUI 界面
+/allow         发送 Enter，执行当前选中的选项
+/deny          发送 Esc，取消/返回
+/key down      向下移动选项
+/key up        向上移动选项
+/key enter     确认当前选项
+```
+
+典型流程是：先用 `/screen` 看当前选项；如果默认选项就是要执行的操作，发送 `/allow`；如果需要选择“本次允许 / 以后不再询问 / 取消”等其他选项，用 `/key up`、`/key down` 调整后再 `/key enter`。
 
 ## 6. 配置文件说明
 
@@ -213,11 +232,57 @@ mode=workspace
   - `plan`：只读分析
   - `workspace`：可写工作区（推荐）
   - `danger`：无沙箱（高风险）
+- `codexProxyMode`：Codex 子进程的代理环境处理方式（可选）
+  - `inherit`：继承当前终端的代理环境变量（默认）
+  - `clear`：启动 Codex 时清除 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` 等代理变量
+- `wechatProxyUrl`：wechat-codex 访问微信 API/CDN 时使用的代理（可选）
+  - 例如 `http://127.0.0.1:7890`
+  - 开学校 VPN 后如果微信消息收不到，可以让微信 API 走 Clash/外网代理，同时 SSH 校内服务器继续走学校 VPN
 
 可通过环境变量修改数据目录：
 
 ```bash
 export WCB_DATA_DIR=/your/path
+```
+
+### 校园网 VPN 与 Codex 冲突时
+
+推荐链路是：
+
+```text
+微信 <-> 本机 wechat-codex <-> 本机 Codex/OpenAI
+                              <-> 校园网 VPN/内网通道 <-> 内网服务器
+```
+
+也就是说，本机同时负责外网 Codex 和内网服务器访问；内网服务器只执行操作，不需要访问 OpenAI。
+
+如果开启校园网 VPN 后 Codex 连接失败，先让 Codex 子进程不要继承终端代理环境。编辑 `~/.wechat-codex-bridge/config.env`：
+
+```env
+workingDirectory=/你的项目路径
+mode=workspace
+codexProxyMode=clear
+```
+
+然后重启：
+
+```bash
+npm start
+```
+
+这只能解决“VPN/代理工具给终端注入代理变量”导致的冲突。如果 VPN 是系统级全局接管路由，还需要在 VPN 或代理工具里做分流：
+
+```text
+OpenAI/Codex 相关域名 -> 走可访问外网的线路
+内网服务器 IP / 学校网段 -> 走校园网 VPN
+```
+
+常见内网网段：
+
+```text
+10.0.0.0/8
+172.16.0.0/12
+192.168.0.0/16
 ```
 
 目录内会自动创建：

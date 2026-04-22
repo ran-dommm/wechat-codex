@@ -26,6 +26,10 @@ export interface NativeBridgeEvents {
   onExit: (code: number | null) => void;
 }
 
+export interface NativeCodexBridgeOptions {
+  proxyMode?: 'inherit' | 'clear';
+}
+
 export interface CodexRateLimitWindow {
   usedPercent: number;
   windowMinutes?: number;
@@ -38,16 +42,8 @@ export interface CodexRateLimitsSnapshot {
   secondary?: CodexRateLimitWindow;
 }
 
-function buildCodexArgs(mode: CodexSpawnMode): string[] {
-  switch (mode) {
-    case 'plan':
-      return ['-s', 'read-only', '-c', 'approval_policy="never"'];
-    case 'danger':
-      return ['--dangerously-bypass-approvals-and-sandbox'];
-    case 'workspace':
-    default:
-      return ['-s', 'workspace-write', '-c', 'approval_policy="never"'];
-  }
+function buildCodexArgs(_mode: CodexSpawnMode): string[] {
+  return ['--sandbox', 'workspace-write', '--ask-for-approval', 'on-request'];
 }
 
 type TurnSource = 'unknown' | 'wechat' | 'terminal';
@@ -81,6 +77,13 @@ export class NativeCodexBridge {
   // the turn is WeChat-sourced; anything else is terminal.
   private pendingWechatInjection: string | null = null;
   private latestRateLimits: CodexRateLimitsSnapshot | null = null;
+  private screen = new TerminalScreen(process.stdout.columns || 120, process.stdout.rows || 30);
+  private ansiStripper = new AnsiStripper();
+  private rawScreenFallback = '';
+  private screenNotifyTimer: NodeJS.Timeout | null = null;
+  private lastInteractivePromptSignature = '';
+  private lastInteractiveScreenSentAt = 0;
+  private suppressInteractiveScreenUntil = 0;
 
   private shuttingDown = false;
   private originalRawMode: boolean | null = null;
@@ -96,6 +99,7 @@ export class NativeCodexBridge {
     private cwd: string,
     private events: NativeBridgeEvents,
     private mode: CodexSpawnMode = 'workspace',
+    private options: NativeCodexBridgeOptions = {},
   ) {}
 
   get isBusy(): boolean {
@@ -118,6 +122,10 @@ export class NativeCodexBridge {
     return this.latestRateLimits;
   }
 
+  getScreenText(): string {
+    return this.screen.snapshot() || this.rawScreenFallback.trim();
+  }
+
   interruptAndClearQueue(): { interrupted: boolean; clearedQueued: number } {
     const clearedQueued = this.wechatQueue.length;
     this.wechatQueue = [];
@@ -130,6 +138,16 @@ export class NativeCodexBridge {
     // Send Ctrl-C to interrupt the current foreground action in the TUI.
     this.ptyProc.write('\x03');
     return { interrupted: true, clearedQueued };
+  }
+
+  sendRawInputToCodex(input: string): boolean {
+    if (!this.ptyProc) return false;
+    this.ptyProc.write(input);
+    return true;
+  }
+
+  suppressAutoScreenNotice(ms: number): void {
+    this.suppressInteractiveScreenUntil = Math.max(this.suppressInteractiveScreenUntil, Date.now() + ms);
   }
 
   async start(): Promise<void> {
@@ -148,13 +166,22 @@ export class NativeCodexBridge {
       cols: process.stdout.columns || 120,
       rows: process.stdout.rows || 30,
       cwd: this.cwd,
-      env: buildEnv(),
+      env: buildEnv(this.options),
     });
 
     this.ptyProc = child;
+    this.screen.reset(process.stdout.columns || 120, process.stdout.rows || 30);
+    this.ansiStripper.reset();
+    this.rawScreenFallback = '';
+    this.lastInteractivePromptSignature = '';
+    this.lastInteractiveScreenSentAt = 0;
+    this.suppressInteractiveScreenUntil = 0;
 
     child.onData((data) => {
       if (myGen !== this.generation) return;
+      this.screen.write(data);
+      this.appendRawScreenFallback(data);
+      this.scheduleInteractiveScreenNotice();
       process.stdout.write(data);
     });
 
@@ -260,8 +287,46 @@ export class NativeCodexBridge {
     if (!this.ptyProc) return;
     const cols = process.stdout.columns || 120;
     const rows = process.stdout.rows || 30;
+    this.screen.resize(cols, rows);
     try { this.ptyProc.resize(cols, rows); } catch { /* resize best effort */ }
   };
+
+  private scheduleInteractiveScreenNotice(): void {
+    if (this.screenNotifyTimer) return;
+    this.screenNotifyTimer = setTimeout(() => {
+      this.screenNotifyTimer = null;
+      this.maybeSendInteractiveScreenNotice();
+    }, 250);
+    this.screenNotifyTimer.unref?.();
+  }
+
+  private maybeSendInteractiveScreenNotice(): void {
+    const snapshot = this.getScreenText();
+    if (!snapshot || !looksLikeInteractivePrompt(snapshot)) return;
+
+    const now = Date.now();
+    if (now < this.suppressInteractiveScreenUntil) return;
+    const signature = interactivePromptSignature(snapshot);
+    if (signature && signature === this.lastInteractivePromptSignature) {
+      return;
+    }
+    if (now - this.lastInteractiveScreenSentAt < 2_500) {
+      return;
+    }
+
+    this.lastInteractivePromptSignature = signature;
+    this.lastInteractiveScreenSentAt = now;
+    this.events.onWechatReply(formatScreenForWechat(snapshot, true));
+  }
+
+  private appendRawScreenFallback(data: string): void {
+    const stripped = this.ansiStripper.write(data);
+    if (!stripped.trim()) return;
+    this.rawScreenFallback = `${this.rawScreenFallback}${stripped}`;
+    if (this.rawScreenFallback.length > 5000) {
+      this.rawScreenFallback = this.rawScreenFallback.slice(-5000);
+    }
+  }
 
   // ── WeChat input dispatch ──
 
@@ -464,6 +529,7 @@ export class NativeCodexBridge {
   private completeActiveTurn(reason: BridgeTurnReason): void {
     const turn = this.activeTurn;
     this.activeTurn = null;
+    this.lastInteractivePromptSignature = '';
 
     if (!turn) {
       this.maybeDispatchQueued();
@@ -497,6 +563,366 @@ export class NativeCodexBridge {
     this.events.onTurnFinalized?.({ source, reason });
     this.maybeDispatchQueued();
   }
+}
+
+class TerminalScreen {
+  private lines: string[][] = [];
+  private cursorRow = 0;
+  private cursorCol = 0;
+  private escBuffer: string | null = null;
+
+  constructor(private cols: number, private rows: number) {
+    this.reset(cols, rows);
+  }
+
+  reset(cols = this.cols, rows = this.rows): void {
+    this.cols = Math.max(20, cols);
+    this.rows = Math.max(5, rows);
+    this.lines = Array.from({ length: this.rows }, () => []);
+    this.cursorRow = 0;
+    this.cursorCol = 0;
+    this.escBuffer = null;
+  }
+
+  resize(cols: number, rows: number): void {
+    const nextCols = Math.max(20, cols);
+    const nextRows = Math.max(5, rows);
+    this.cols = nextCols;
+    if (nextRows > this.rows) {
+      for (let i = this.rows; i < nextRows; i++) this.lines.push([]);
+    } else if (nextRows < this.rows) {
+      this.lines = this.lines.slice(this.rows - nextRows);
+      this.cursorRow = Math.max(0, Math.min(this.cursorRow, nextRows - 1));
+    }
+    this.rows = nextRows;
+    this.cursorCol = Math.max(0, Math.min(this.cursorCol, this.cols - 1));
+  }
+
+  write(data: string): void {
+    for (const ch of Array.from(data)) {
+      if (this.escBuffer !== null) {
+        this.escBuffer += ch;
+        if (this.tryHandleEscape(this.escBuffer)) {
+          this.escBuffer = null;
+        } else if (this.escBuffer.length > 80) {
+          this.escBuffer = null;
+        }
+        continue;
+      }
+
+      if (ch === '\x1b') {
+        this.escBuffer = ch;
+        continue;
+      }
+      this.writeChar(ch);
+    }
+  }
+
+  snapshot(): string {
+    const rendered = this.lines.map((line) => line.join('').replace(/\s+$/g, ''));
+    while (rendered.length > 0 && !rendered[0].trim()) rendered.shift();
+    while (rendered.length > 0 && !rendered[rendered.length - 1].trim()) rendered.pop();
+    const text = rendered.join('\n').trim();
+    return text.length > 3500 ? text.slice(-3500).trimStart() : text;
+  }
+
+  private writeChar(ch: string): void {
+    if (ch === '\r') {
+      this.cursorCol = 0;
+      return;
+    }
+    if (ch === '\n') {
+      this.newLine();
+      return;
+    }
+    if (ch === '\b' || ch === '\x7f') {
+      this.cursorCol = Math.max(0, this.cursorCol - 1);
+      return;
+    }
+    if (ch === '\t') {
+      const spaces = 4 - (this.cursorCol % 4);
+      for (let i = 0; i < spaces; i++) this.putPrintable(' ');
+      return;
+    }
+    if (ch < ' ' || ch === '\x9b') return;
+    this.putPrintable(ch);
+  }
+
+  private putPrintable(ch: string): void {
+    if (this.cursorCol >= this.cols) this.newLine();
+    const line = this.lines[this.cursorRow] ?? [];
+    while (line.length < this.cursorCol) line.push(' ');
+    line[this.cursorCol] = ch;
+    this.lines[this.cursorRow] = line;
+    this.cursorCol++;
+  }
+
+  private newLine(): void {
+    this.cursorCol = 0;
+    this.cursorRow++;
+    if (this.cursorRow >= this.rows) {
+      this.lines.shift();
+      this.lines.push([]);
+      this.cursorRow = this.rows - 1;
+    }
+  }
+
+  private tryHandleEscape(seq: string): boolean {
+    if (seq === '\x1b' || seq === '\x1b[' || seq === '\x1b]') {
+      return false;
+    }
+    if (seq === '\x1bc') {
+      this.clearAll();
+      return true;
+    }
+    if (seq.startsWith('\x1b]')) {
+      return seq.endsWith('\x07') || seq.endsWith('\x1b\\');
+    }
+    if (!seq.startsWith('\x1b[')) {
+      return seq.length >= 2;
+    }
+    if (seq.length <= 2) return false;
+
+    const final = seq[seq.length - 1];
+    if (!final || final < '@' || final > '~') return false;
+    const body = seq.slice(2, -1).replace(/[?=]/g, '');
+    const nums = body
+      .split(';')
+      .filter(Boolean)
+      .map((part) => Number.parseInt(part, 10))
+      .map((n) => Number.isFinite(n) ? n : 0);
+    const first = nums[0] ?? 0;
+
+    switch (final) {
+      case 'A':
+        this.cursorRow = Math.max(0, this.cursorRow - (first || 1));
+        break;
+      case 'B':
+        this.cursorRow = Math.min(this.rows - 1, this.cursorRow + (first || 1));
+        break;
+      case 'C':
+        this.cursorCol = Math.min(this.cols - 1, this.cursorCol + (first || 1));
+        break;
+      case 'D':
+        this.cursorCol = Math.max(0, this.cursorCol - (first || 1));
+        break;
+      case 'G':
+        this.cursorCol = Math.max(0, Math.min(this.cols - 1, (first || 1) - 1));
+        break;
+      case 'H':
+      case 'f':
+        this.cursorRow = Math.max(0, Math.min(this.rows - 1, (nums[0] || 1) - 1));
+        this.cursorCol = Math.max(0, Math.min(this.cols - 1, (nums[1] || 1) - 1));
+        break;
+      case 'J':
+        this.eraseDisplay(first);
+        break;
+      case 'K':
+        this.eraseLine(first);
+        break;
+      case 'm':
+      case 'h':
+      case 'l':
+      case 's':
+      case 'u':
+        break;
+      default:
+        break;
+    }
+    return true;
+  }
+
+  private clearAll(): void {
+    this.lines = Array.from({ length: this.rows }, () => []);
+    this.cursorRow = 0;
+    this.cursorCol = 0;
+  }
+
+  private eraseDisplay(mode: number): void {
+    if (mode === 2 || mode === 3) {
+      this.clearAll();
+      return;
+    }
+    if (mode === 1) {
+      for (let r = 0; r < this.cursorRow; r++) this.lines[r] = [];
+      this.lines[this.cursorRow] = (this.lines[this.cursorRow] ?? []).slice(this.cursorCol);
+      return;
+    }
+    this.lines[this.cursorRow] = (this.lines[this.cursorRow] ?? []).slice(0, this.cursorCol);
+    for (let r = this.cursorRow + 1; r < this.rows; r++) this.lines[r] = [];
+  }
+
+  private eraseLine(mode: number): void {
+    const line = this.lines[this.cursorRow] ?? [];
+    if (mode === 2) {
+      this.lines[this.cursorRow] = [];
+    } else if (mode === 1) {
+      this.lines[this.cursorRow] = line.slice(this.cursorCol);
+    } else {
+      this.lines[this.cursorRow] = line.slice(0, this.cursorCol);
+    }
+  }
+}
+
+class AnsiStripper {
+  private pending = '';
+
+  reset(): void {
+    this.pending = '';
+  }
+
+  write(input: string): string {
+    const combined = this.pending + input;
+    this.pending = '';
+    let output = '';
+
+    for (let i = 0; i < combined.length; i++) {
+      const ch = combined[i];
+      if (ch !== '\x1b') {
+        output += ch === '\r' ? '\n' : ch;
+        continue;
+      }
+
+      const parsed = this.consumeEscape(combined, i);
+      if (parsed === null) {
+        this.pending = combined.slice(i);
+        break;
+      }
+      i = parsed - 1;
+    }
+
+    if (this.pending.length > 120) {
+      this.pending = '';
+    }
+    return output;
+  }
+
+  private consumeEscape(input: string, start: number): number | null {
+    const next = input[start + 1];
+    if (!next) return null;
+
+    if (next === '[') {
+      for (let i = start + 2; i < input.length; i++) {
+        const code = input.charCodeAt(i);
+        if (code >= 0x40 && code <= 0x7e) {
+          return i + 1;
+        }
+      }
+      return null;
+    }
+
+    if (next === ']') {
+      for (let i = start + 2; i < input.length; i++) {
+        if (input[i] === '\x07') return i + 1;
+        if (input[i] === '\x1b' && input[i + 1] === '\\') return i + 2;
+      }
+      return null;
+    }
+
+    if (next === 'P' || next === '_' || next === '^') {
+      for (let i = start + 2; i < input.length; i++) {
+        if (input[i] === '\x1b' && input[i + 1] === '\\') return i + 2;
+      }
+      return null;
+    }
+
+    return start + 2;
+  }
+}
+
+export function formatScreenForWechat(screenText: string, automatic = false): string {
+  const text = screenText.trim() || '当前 Codex TUI 没有可显示内容。';
+  const title = automatic ? 'Codex 可能正在等待你选择：' : 'Codex 当前界面：';
+  return [
+    title,
+    '',
+    '```text',
+    text,
+    '```',
+    '',
+    '可用操作：/key up、/key down、/key enter、/key esc、/key y、/key p、/screen',
+  ].join('\n');
+}
+
+function looksLikeInteractivePrompt(screenText: string): boolean {
+  const lower = screenText.toLowerCase();
+  const hasQuestion =
+    lower.includes('run the following command') ||
+    lower.includes('would you like') ||
+    lower.includes('do you want') ||
+    lower.includes('execute command') ||
+    lower.includes('continue?') ||
+    screenText.includes('权限') ||
+    screenText.includes('运行命令') ||
+    screenText.includes('执行命令');
+
+  if (
+    !hasQuestion &&
+    (
+      lower.includes('you approved') ||
+      lower.includes('• working') ||
+      lower.includes('• running') ||
+      lower.includes('• ran ')
+    )
+  ) {
+    return false;
+  }
+
+  const hasChoice =
+    lower.includes('yes, proceed') ||
+    lower.includes("don't ask again") ||
+    lower.includes('tell codex what to do differently') ||
+    lower.includes('no, and') ||
+    screenText.includes('(y/n)') ||
+    screenText.includes('(y)') ||
+    screenText.includes('(p)') ||
+    screenText.includes('(esc)');
+
+  const hasActiveChoiceMarker =
+    screenText.includes('›') ||
+    screenText.includes('❯') ||
+    screenText.includes('▸') ||
+    screenText.includes('▶') ||
+    screenText.includes('› 1.') ||
+    screenText.includes('❯ 1.') ||
+    screenText.includes('▸ 1.') ||
+    screenText.includes('▶ 1.') ||
+    screenText.includes('> 1.') ||
+    screenText.includes('[?]');
+
+  return hasQuestion && hasChoice && hasActiveChoiceMarker;
+}
+
+function interactivePromptSignature(screenText: string): string {
+  const stableLines = screenText
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => {
+      const lower = line.toLowerCase();
+      if (lower.startsWith('running')) return false;
+      if (lower.includes('press enter to confirm')) return false;
+      if (lower.includes('press enter') && lower.includes('esc')) return false;
+      return (
+        lower.includes('would you like') ||
+        lower.includes('run the following command') ||
+        lower.includes('reason:') ||
+        lower.startsWith('$ ') ||
+        lower.includes('yes, proceed') ||
+        lower.includes("don't ask again") ||
+        lower.includes('tell codex what to do differently') ||
+        lower.includes('no, and') ||
+        line.includes('权限') ||
+        line.includes('运行命令') ||
+        line.includes('执行命令') ||
+        line.includes('(y)') ||
+        line.includes('(p)') ||
+        line.includes('(esc)')
+      );
+    });
+
+  const basis = stableLines.length > 0 ? stableLines.join('\n') : screenText;
+  return basis.replace(/\s+/g, ' ').trim().slice(0, 1200);
 }
 
 // ── Helpers ──
@@ -563,10 +989,26 @@ function parseWechatAttachments(text: string): {
   return { visibleText, attachments };
 }
 
-function buildEnv(): Record<string, string> {
+const PROXY_ENV_KEYS = [
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'ALL_PROXY',
+  'NO_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'all_proxy',
+  'no_proxy',
+];
+
+function buildEnv(options: NativeCodexBridgeOptions = {}): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (typeof v === 'string') env[k] = v;
+  }
+  if (options.proxyMode === 'clear') {
+    for (const key of PROXY_ENV_KEYS) {
+      delete env[key];
+    }
   }
   env.TERM = env.TERM || 'xterm-256color';
   return env;
