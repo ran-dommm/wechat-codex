@@ -3,6 +3,7 @@ import process from 'node:process';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { existsSync, mkdirSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { ProxyAgent, setGlobalDispatcher } from 'undici';
 
 import { WeChatApi } from './wechat/api.js';
 import { loadLatestAccount } from './wechat/accounts.js';
@@ -20,7 +21,7 @@ import {
 } from './wechat/media.js';
 import { createSessionStore, type Session } from './session.js';
 import { routeCommand, type CommandContext, type CommandResult } from './commands/router.js';
-import { NativeCodexBridge } from './codex/native-bridge.js';
+import { NativeCodexBridge, formatScreenForWechat } from './codex/native-bridge.js';
 import { DEFAULT_WORKING_DIRECTORY, loadConfig, saveConfig } from './config.js';
 import { logger } from './logger.js';
 import { dequeueQueuedMessage, enqueueQueuedMessage } from './message-queue.js';
@@ -189,7 +190,19 @@ function isImageFile(filePath: string): boolean {
   return IMAGE_EXTENSIONS.has(ext);
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function configureFetchProxy(proxyUrl?: string): void {
+  const url = proxyUrl?.trim();
+  if (!url) return;
+  setGlobalDispatcher(new ProxyAgent(url));
+  logger.info('Configured fetch proxy', { proxyUrl: url });
+}
+
 async function runSetup(): Promise<void> {
+  configureFetchProxy(loadConfig().wechatProxyUrl);
   mkdirSync(DATA_DIR, { recursive: true });
   const qrPath = join(DATA_DIR, 'qrcode.png');
 
@@ -254,6 +267,7 @@ async function runSetup(): Promise<void> {
 
 async function runDaemon(): Promise<void> {
   const config = loadConfig();
+  configureFetchProxy(config.wechatProxyUrl);
   const maybeAccount = loadLatestAccount();
 
   if (!maybeAccount) {
@@ -437,7 +451,9 @@ async function runDaemon(): Promise<void> {
       monitor.stop();
       process.exit(code ?? 0);
     },
-  }, mode);
+  }, mode, {
+    proxyMode: config.codexProxyMode ?? 'inherit',
+  });
 
   // ── WeChat Monitor ──
 
@@ -480,6 +496,23 @@ async function runDaemon(): Promise<void> {
         };
 
         const result: CommandResult = routeCommand(ctx);
+        if (result.screenRequested) {
+          await sender.sendText(fromUserId, contextToken, formatScreenForWechat(bridge.getScreenText()));
+          return;
+        }
+        if (result.codexInput) {
+          const sent = bridge.sendRawInputToCodex(result.codexInput.sequence);
+          if (!sent) {
+            await sender.sendText(fromUserId, contextToken, '⚠️ Codex TUI 尚未启动，无法发送按键。');
+            return;
+          }
+          bridge.suppressAutoScreenNotice(5000);
+          await delay(300);
+          const screen = bridge.getScreenText();
+          const lines = result.reply ? [result.reply, '', formatScreenForWechat(screen)] : [formatScreenForWechat(screen)];
+          await sender.sendText(fromUserId, contextToken, lines.join('\n'));
+          return;
+        }
         if (result.nowPrompt !== undefined) {
           const droppedExternal = clearQueuedMessages(account.accountId);
           const { interrupted, clearedQueued: droppedBridge } = bridge.interruptAndClearQueue();
@@ -622,11 +655,8 @@ async function runDaemon(): Promise<void> {
 
   logger.info('Daemon started', { accountId: account.accountId, cwd });
 
-  const modeDesc = mode === 'plan' ? 'plan (read-only)'
-    : mode === 'danger' ? 'danger (no sandbox)'
-    : 'workspace (writable sandbox, auto-approve off)';
   console.log(`[wechat-codex] Starting native Codex TUI (cwd: ${cwd})`);
-  console.log(`[wechat-codex] Mode: ${modeDesc}  |  approval_policy: never`);
+  console.log('[wechat-codex] Codex args: --sandbox workspace-write --ask-for-approval on-request');
   console.log('[wechat-codex] WeChat messages will be forwarded to Codex automatically.\n');
 
   await bridge.start();

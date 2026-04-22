@@ -33,9 +33,11 @@ export interface CodexStreamEvent {
 
 export type CodexStreamCallback = (event: CodexStreamEvent) => void;
 
+const CODEX_LAUNCH_ARGS = ['--sandbox', 'workspace-write', '--ask-for-approval', 'on-request'];
+
 export function buildCodexArgs(options: CodexRunOptions): string[] {
   if (options.threadId) {
-    const args: string[] = ['exec', 'resume', '--json', '--skip-git-repo-check'];
+    const args: string[] = [...CODEX_LAUNCH_ARGS, 'exec', 'resume', '--json', '--skip-git-repo-check'];
     if (options.model) {
       args.push('-m', options.model);
     }
@@ -46,16 +48,9 @@ export function buildCodexArgs(options: CodexRunOptions): string[] {
     return args;
   }
 
-  const args: string[] = ['exec', '--json', '--skip-git-repo-check', '-C', options.cwd];
+  const args: string[] = [...CODEX_LAUNCH_ARGS, 'exec', '--json', '--skip-git-repo-check', '-C', options.cwd];
   if (options.model) {
     args.push('-m', options.model);
-  }
-  if (options.mode === 'plan') {
-    args.push('-s', 'read-only', '-c', 'approval_policy="never"');
-  } else if (options.mode === 'workspace') {
-    args.push('-s', 'workspace-write', '-c', 'approval_policy="never"');
-  } else {
-    args.push('--dangerously-bypass-approvals-and-sandbox');
   }
   for (const imagePath of options.images ?? []) {
     args.push('--image', imagePath);
