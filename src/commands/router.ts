@@ -8,9 +8,9 @@ import {
   handleMode,
   handleCwd,
   handleStatus,
+  handleReceive,
   handleSkills,
   handleUnknown,
-  handlePermissionAlias,
 } from './handlers.js';
 
 export interface CommandContext {
@@ -26,6 +26,8 @@ export interface CommandResult {
   codexPrompt?: string; // If set, this text should be sent to Codex
   nowPrompt?: string; // If set, interrupt current work and run this immediately
   codexAuthProfile?: string; // If set, switch auth profile in main runtime
+  restartBridge?: boolean; // If true, restart the native Codex process to apply startup options
+  receiveDeferred?: boolean; // If true, deliver deferred WeChat texts without sending a Codex turn
 }
 
 /**
@@ -40,6 +42,7 @@ export interface CommandResult {
  *   /status   - Show current session info
  *   /codex-auth - Show/save/switch Codex auth profile
  *   /now <text> - Interrupt current turn, clear queue, and run text now
+ *   /receive - Deliver deferred WeChat texts without sending a Codex turn
  *   /skills   - List all installed skills
  *   /<skill>  - Invoke a skill by name (args are forwarded to Claude)
  */
@@ -67,10 +70,10 @@ export function routeCommand(ctx: CommandContext): CommandResult {
       return handleCwd(ctx, args);
     case 'mode':
       return handleMode(ctx, args);
-    case 'permission':
-      return handlePermissionAlias();
     case 'status':
       return handleStatus(ctx);
+    case 'receive':
+      return handleReceive();
     case 'codex-auth':
       return handleCodexAuth(args);
     case 'now':

@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { scanAllSkills, findSkill, type SkillInfo } from '../codex/skill-scanner.js';
 import { getCurrentAuthProfile, listAuthProfiles, saveCurrentAuthProfile, validateProfileName } from '../codex/auth-profiles.js';
+import type { ExecutionMode } from '../session.js';
 
 const HELP_TEXT = `可用命令：
 
@@ -15,6 +16,7 @@ const HELP_TEXT = `可用命令：
   /codex-auth       查看/保存/切换 Codex 认证账号
   /status           查看当前会话状态
   /now <内容>       中断当前回合并清空排队，立即执行内容
+  /receive          接收此前暂存的微信回复
   /skills           列出已安装的 skills
   /<skill> [参数]   触发已安装的 skill
 
@@ -82,13 +84,22 @@ export function handleCwd(ctx: CommandContext, args: string): CommandResult {
   return {
     reply: `✅ 工作目录已切换为: ${nextPath}\n正在重启 Codex 会话以应用新目录与沙箱范围，请稍候。`,
     handled: true,
+    restartBridge: true,
   };
 }
 
-const MODE_DESCRIPTIONS: Record<string, string> = {
+const MODE_DESCRIPTIONS: Record<ExecutionMode, string> = {
   plan: '只读分析模式',
   workspace: '工作区可写模式',
   danger: '无沙箱模式',
+};
+
+const MODE_ALIASES: Record<string, ExecutionMode> = {
+  plan: 'plan',
+  workspace: 'workspace',
+  danger: 'danger',
+  sandbox: 'workspace',
+  sudo: 'danger',
 };
 
 export function handleMode(ctx: CommandContext, args: string): CommandResult {
@@ -98,31 +109,33 @@ export function handleMode(ctx: CommandContext, args: string): CommandResult {
       '🔒 当前执行模式: ' + current,
       '',
       '可用模式:',
-      ...Object.entries(MODE_DESCRIPTIONS).map(([mode, desc]) => `  ${mode} — ${desc}`),
+      '  sandbox — 工作目录可写沙箱（等同 workspace）',
+      '  sudo — 无 Codex 沙箱（等同 danger）',
+      '  plan — 只读分析模式',
+      '  workspace — 工作区可写模式',
+      '  danger — 无沙箱模式',
       '',
-      '用法: /mode <模式>',
+      '用法: /mode sandbox|sudo|plan|workspace|danger',
     ];
     return { reply: lines.join('\n'), handled: true };
   }
-  const mode = args.trim().toLowerCase();
-  if (!(mode in MODE_DESCRIPTIONS)) {
+  const input = args.trim().toLowerCase();
+  const mode = MODE_ALIASES[input];
+  if (!mode) {
     return {
-      reply: `未知模式: ${mode}\n可用: ${Object.keys(MODE_DESCRIPTIONS).join(', ')}`,
+      reply: `未知模式: ${input}\n可用: sandbox, sudo, plan, workspace, danger`,
       handled: true,
     };
   }
-  ctx.updateSession({ mode: mode as any, threadId: undefined });
+  const previous = ctx.session.mode ?? 'workspace';
+  ctx.updateSession({ mode, threadId: undefined });
   const warning = mode === 'danger' ? '\n\n⚠️ danger 模式会以无沙箱方式运行本机 Codex。' : '';
   return {
-    reply: `✅ 执行模式已记录为: ${mode}\n${MODE_DESCRIPTIONS[mode]}\n\n⚠️ 新模式需重启服务 (npm start) 才会生效，因为它决定了原生 Codex 的启动参数。${warning}`,
+    reply: previous === mode
+      ? `当前已经是: ${mode}\n${MODE_DESCRIPTIONS[mode]}`
+      : `✅ 执行模式已切换为: ${mode}\n${MODE_DESCRIPTIONS[mode]}\n正在重启 Codex 会话以应用新模式。${warning}`,
     handled: true,
-  };
-}
-
-export function handlePermissionAlias(): CommandResult {
-  return {
-    handled: true,
-    reply: 'Codex bridge 不支持 Claude SDK 那种逐工具权限回调。请使用 /mode plan|workspace|danger 控制执行级别。',
+    restartBridge: previous !== mode,
   };
 }
 
@@ -141,6 +154,10 @@ export function handleStatus(ctx: CommandContext): CommandResult {
     `状态: ${s.state}`,
   ];
   return { reply: lines.join('\n'), handled: true };
+}
+
+export function handleReceive(): CommandResult {
+  return { handled: true, receiveDeferred: true };
 }
 
 export function handleCodexAuth(args: string): CommandResult {

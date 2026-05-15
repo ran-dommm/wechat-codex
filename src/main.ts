@@ -22,7 +22,7 @@ import {
 import { createSessionStore, type Session } from './session.js';
 import { routeCommand, type CommandContext, type CommandResult } from './commands/router.js';
 import { NativeCodexBridge } from './codex/native-bridge.js';
-import type { BridgeTurnSource } from './codex/native-bridge.js';
+import type { BridgeTurnSource, CodexSpawnMode } from './codex/native-bridge.js';
 import { runCodexAuthCli } from './codex/auth-cli.js';
 import { useAuthProfile } from './codex/auth-profiles.js';
 import { DEFAULT_WORKING_DIRECTORY, loadConfig, saveConfig } from './config.js';
@@ -32,9 +32,11 @@ import { DATA_DIR, TMP_DIR } from './constants.js';
 import { splitMessage } from './utils/chunk.js';
 import { MessageType, type WeixinMessage } from './wechat/types.js';
 
+type WechatMedia = ReturnType<typeof extractFirstSupportedMedia>;
+
 interface QueuedCodexMessage {
   userText: string;
-  media: ReturnType<typeof extractFirstSupportedMedia>;
+  media: WechatMedia;
   fromUserId: string;
   contextToken: string;
 }
@@ -386,14 +388,24 @@ async function runDaemon(): Promise<void> {
     lastRecipient = recipient;
     session.lastRecipient = recipient;
     sessionStore.save(session);
-    flushDeferredWechatTexts();
   }
 
-  function flushDeferredWechatTexts(): void {
-    if (!lastRecipient || deferredWechatTexts.length === 0) return;
-    const pending = deferredWechatTexts;
-    deferredWechatTexts = [];
-    void sendTextToWechat(`（以下为此前因没有微信收件人而暂存的终端同步消息）\n\n${pending.join('\n\n')}`);
+  async function receiveDeferredWechatTexts(recipient: WechatRecipient): Promise<void> {
+    await enqueueWechatSend(async () => {
+      if (deferredWechatTexts.length === 0) {
+        await sendTextNow('当前没有暂存消息。', recipient);
+        return;
+      }
+
+      const pending = deferredWechatTexts;
+      deferredWechatTexts = [];
+      try {
+        await sendTextNow(`（以下为此前暂存的微信回复）\n\n${pending.join('\n\n')}`, recipient);
+      } catch (err) {
+        deferredWechatTexts = [...pending, ...deferredWechatTexts].slice(-MAX_DEFERRED_WECHAT_TEXTS);
+        throw err;
+      }
+    });
   }
 
   async function sendImageToWechat(imagePath: string): Promise<void> {
@@ -453,7 +465,7 @@ async function runDaemon(): Promise<void> {
 
   async function sendWechatMessageToCodex(
     userText: string,
-    media: ReturnType<typeof extractFirstSupportedMedia>,
+    media: WechatMedia,
     fromUserId: string,
     contextToken: string,
   ): Promise<void> {
@@ -578,7 +590,9 @@ async function runDaemon(): Promise<void> {
 
   // ── Native Codex Bridge ──
 
-  const mode = (session.mode ?? config.mode ?? 'workspace') as 'plan' | 'workspace' | 'danger';
+  const currentBridgeMode = (): CodexSpawnMode => (session.mode ?? config.mode ?? 'workspace') as CodexSpawnMode;
+
+  const mode = currentBridgeMode();
   const bridge = new NativeCodexBridge(cwd, {
     onWechatReply: (text) => {
       return sendTextToWechat(text);
@@ -616,6 +630,13 @@ async function runDaemon(): Promise<void> {
         clearSession: () => sessionStore.clear(session),
         text: message,
       });
+      if (result.restartBridge) {
+        void bridge.restart(session.workingDirectory || config.workingDirectory, currentBridgeMode()).catch((err) => {
+          logger.error('Failed to restart bridge after terminal command', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }
       const reply = result.codexAuthProfile
         ? '请使用 npm run codex-auth use <name> 在终端切换 Codex 认证账号，或从微信端发送 /codex-auth use <name>。'
         : result.reply ?? (result.handled ? '终端命令已处理。' : '');
@@ -672,6 +693,16 @@ async function runDaemon(): Promise<void> {
         };
 
         const result: CommandResult = routeCommand(ctx);
+        if (result.receiveDeferred) {
+          try {
+            await receiveDeferredWechatTexts({ userId: fromUserId, contextToken });
+          } catch (err) {
+            logger.warn('Failed to deliver deferred WeChat texts', {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+          return;
+        }
         if (result.codexAuthProfile) {
           await switchCodexAuthProfile(result.codexAuthProfile, fromUserId, contextToken);
           return;
@@ -701,16 +732,16 @@ async function runDaemon(): Promise<void> {
           return;
         }
         if (result.reply) {
-          if (slashCommand === 'cwd' && session.workingDirectory) {
+          if (result.restartBridge) {
             try {
-              await bridge.restart(session.workingDirectory);
+              await bridge.restart(session.workingDirectory || config.workingDirectory, currentBridgeMode());
             } catch (err) {
               const errMsg = err instanceof Error ? err.message : String(err);
-              logger.error('Failed to restart bridge after /cwd', { error: errMsg });
+              logger.error('Failed to restart bridge after slash command', { command: slashCommand, error: errMsg });
               await sender.sendText(
                 fromUserId,
                 contextToken,
-                `⚠️ 工作目录已记录，但重启 Codex 失败：${errMsg.slice(0, 200)}`,
+                `⚠️ 设置已记录，但重启 Codex 失败：${errMsg.slice(0, 200)}`,
               );
               return;
             }

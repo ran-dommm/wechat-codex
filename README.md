@@ -186,8 +186,9 @@ The experiment is still running; nothing to send yet.
 - `/status`：查看当前会话状态（工作目录、模型、模式、线程、剩余额度等）
 - `/cwd <路径>`：切换工作目录（会重启 Codex 会话）
 - `/model <模型名>`：切换模型
-- `/mode <plan|workspace|danger>`：切换运行模式（重启服务后生效）
+- `/mode <sandbox|sudo|plan|workspace|danger>`：切换执行模式（会自动重启 Codex 会话）
 - `/now <内容>`：中断当前处理并立刻执行这条内容
+- `/receive`：接收此前因没有微信收件人或发送失败而暂存的回复，不会转给 Codex
 - `/clear`：清空当前会话
 - `/codex-auth current|list|save <name>|use <name>`：查看、保存或切换 Codex 认证账号
 - `/skills`：列出可用 skills
@@ -230,7 +231,33 @@ export WCB_DATA_DIR=/your/path
 - `logs/`
 - `tmp/`
 
-### 6.1 Codex Auth Profiles
+### 6.1 执行模式
+
+常用模式：
+
+- `sandbox`：对应 Codex `workspace-write`，写权限限制在当前工作目录范围内
+- `sudo`：对应 Codex `--dangerously-bypass-approvals-and-sandbox`，关闭 Codex 沙箱
+- `plan`：对应 Codex `read-only`，只读分析
+
+命令：
+
+```text
+/mode
+/mode sandbox
+/mode sudo
+/mode plan
+```
+
+`sudo` 不是 Linux root。它只是关闭 Codex 沙箱，实际仍受运行 `wechat-codex` 的系统用户权限限制。
+
+底层名称也保留兼容：
+
+```text
+/mode workspace  # 等同 sandbox
+/mode danger     # 等同 sudo
+```
+
+### 6.2 Codex Auth Profiles
 
 `wechat-codex` 只切换 `~/.codex/auth.json`，不会复制 `config.toml`、`AGENTS.md`、history 或 sessions。
 

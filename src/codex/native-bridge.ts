@@ -195,11 +195,11 @@ export class NativeCodexBridge {
     this.startPolling();
   }
 
-  async restart(newCwd?: string): Promise<void> {
+  async restart(newCwd?: string, newMode?: CodexSpawnMode): Promise<void> {
     if (this.restarting) {
       await this.restarting;
     }
-    this.restarting = this.doRestart(newCwd);
+    this.restarting = this.doRestart(newCwd, newMode);
     try {
       await this.restarting;
     } finally {
@@ -207,8 +207,9 @@ export class NativeCodexBridge {
     }
   }
 
-  private async doRestart(newCwd?: string): Promise<void> {
+  private async doRestart(newCwd?: string, newMode?: CodexSpawnMode): Promise<void> {
     if (newCwd) this.cwd = newCwd;
+    if (newMode) this.mode = newMode;
 
     this.stopPolling();
     this.sessionFilePath = null;
