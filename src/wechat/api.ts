@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import type {
   GetUpdatesResp,
   SendMessageReq,
+  SendMessageResp,
   GetUploadUrlResp,
 } from './types.js';
 import { logger } from '../logger.js';
@@ -85,7 +86,14 @@ export class WeChatApi {
   }
 
   async sendMessage(req: SendMessageReq): Promise<void> {
-    await this.request('ilink/bot/sendmessage', req as unknown as Record<string, unknown>);
+    const resp = await this.request<SendMessageResp>(
+      'ilink/bot/sendmessage',
+      req as unknown as Record<string, unknown>,
+    );
+    if (typeof resp.ret === 'number' && resp.ret !== 0) {
+      const suffix = resp.retmsg ? `: ${resp.retmsg}` : '';
+      throw new Error(`sendmessage failed ret=${resp.ret}${suffix}`);
+    }
   }
 
   async getUploadUrl(

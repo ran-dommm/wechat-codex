@@ -1,12 +1,23 @@
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve as resolvePath } from 'node:path';
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+} from 'node:fs';
 import * as pty from 'node-pty';
+import { logger } from '../logger.js';
 
 const CODEX_HOME = process.env.CODEX_HOME || join(homedir(), '.codex');
 const SESSIONS_ROOT = join(CODEX_HOME, 'sessions');
-const SESSION_POLL_INTERVAL_MS = 300;
-const SESSION_DISCOVER_INTERVAL_MS = 1000;
+const SESSION_POLL_INTERVAL_MS = 100;
+const SESSION_DISCOVER_INTERVAL_MS = 200;
+const TERMINAL_IDLE_BEFORE_INJECT_MS = 1500;
 
 export type CodexSpawnMode = 'plan' | 'workspace' | 'danger';
 
@@ -18,10 +29,11 @@ export interface WechatAttachment {
 }
 
 export interface NativeBridgeEvents {
-  onWechatReply: (text: string) => void;
-  onWechatAttachment: (attachment: WechatAttachment) => void;
+  onWechatReply: (text: string) => void | Promise<void>;
+  onWechatAttachment: (attachment: WechatAttachment) => void | Promise<void>;
   onWechatTurnComplete: () => void;
-  onTurnFinalized?: (info: { source: BridgeTurnSource; reason: BridgeTurnReason }) => void;
+  onTurnFinalized?: (info: { source: BridgeTurnSource; reason: BridgeTurnReason }) => void | Promise<void>;
+  onTerminalUserMessage?: (message: string) => boolean;
   onError: (message: string) => void;
   onExit: (code: number | null) => void;
 }
@@ -58,9 +70,18 @@ interface ActiveTurn {
   turnId: string | null;
   source: TurnSource;
   texts: string[];
+  suppressWechatOutput?: boolean;
+  finalEmitted?: boolean;
+  finalDelivery?: Promise<void>;
   // Buffered commentary messages that arrived before user_message (rare).
   // Once source is resolved they are flushed to WeChat.
   pendingCommentary: string[];
+}
+
+interface PendingWechatInjection {
+  id: string;
+  text: string;
+  startedAtMs: number;
 }
 
 export class NativeCodexBridge {
@@ -76,11 +97,14 @@ export class NativeCodexBridge {
 
   private wechatQueue: string[] = [];
   private activeTurn: ActiveTurn | null = null;
-  // Text we injected via PTY that is still waiting to be echoed by Codex as
-  // a `user_message` event. When we see a user_message matching this, we know
-  // the turn is WeChat-sourced; anything else is terminal.
-  private pendingWechatInjection: string | null = null;
+  // WeChat text injected via PTY that is still waiting to be echoed by Codex as
+  // a `user_message` event. When we see a matching user_message, we know the
+  // turn is WeChat-sourced; anything else is terminal.
+  private pendingWechatInjection: PendingWechatInjection | null = null;
   private latestRateLimits: CodexRateLimitsSnapshot | null = null;
+  private injectionCounter = 0;
+  private lastStdinAtMs = 0;
+  private dispatchTimer: NodeJS.Timeout | null = null;
 
   private shuttingDown = false;
   private originalRawMode: boolean | null = null;
@@ -122,6 +146,7 @@ export class NativeCodexBridge {
     const clearedQueued = this.wechatQueue.length;
     this.wechatQueue = [];
     this.pendingWechatInjection = null;
+    this.clearDispatchTimer();
 
     if (!this.ptyProc) {
       return { interrupted: false, clearedQueued };
@@ -210,6 +235,7 @@ export class NativeCodexBridge {
 
   async stop(): Promise<void> {
     this.shuttingDown = true;
+    this.clearDispatchTimer();
     this.stopForwardingStdin();
     this.stopPolling();
     if (this.ptyProc) {
@@ -226,7 +252,7 @@ export class NativeCodexBridge {
       }
     }
     if (text) parts.push(text);
-    const fullText = parts.join('\n');
+    const fullText = sanitizeBridgeInjectionMarkers(parts.join('\n'));
     this.wechatQueue.push(fullText);
     this.maybeDispatchQueued();
   }
@@ -234,6 +260,7 @@ export class NativeCodexBridge {
   // ── stdin forwarding ──
 
   private stdinListener = (data: Buffer) => {
+    this.lastStdinAtMs = Date.now();
     if (this.ptyProc) {
       this.ptyProc.write(data.toString('utf8'));
     }
@@ -270,11 +297,17 @@ export class NativeCodexBridge {
     // Don't inject while any turn is running or another WeChat injection is
     // still awaiting its user_message echo.
     if (this.activeTurn || this.pendingWechatInjection !== null) return;
+    const idleForMs = Date.now() - this.lastStdinAtMs;
+    if (this.lastStdinAtMs > 0 && idleForMs < TERMINAL_IDLE_BEFORE_INJECT_MS) {
+      this.scheduleDispatch(TERMINAL_IDLE_BEFORE_INJECT_MS - idleForMs);
+      return;
+    }
     const next = this.wechatQueue.shift();
     if (!next) return;
 
-    this.pendingWechatInjection = next;
-    void this.injectMessage(next);
+    const injection = this.createWechatInjection(next);
+    this.pendingWechatInjection = injection;
+    void this.injectMessage(injection);
   }
 
   // Inject a message into the PTY as if typed by the user, then submit.
@@ -283,26 +316,52 @@ export class NativeCodexBridge {
   // trailing Enter, waiting for the user to press Enter again. To work around
   // this, we write the body, settle for a moment so the TUI exits paste mode,
   // then send a standalone Enter to actually submit.
-  private async injectMessage(text: string): Promise<void> {
+  private async injectMessage(injection: PendingWechatInjection): Promise<void> {
     if (!this.ptyProc) return;
 
     // Normalize: Codex composer uses \r for newline within the input field;
     // \n can be interpreted inconsistently depending on TUI state.
-    const normalized = text.replace(/\r?\n/g, '\r');
+    const normalized = injection.text.replace(/\r?\n/g, '\r');
 
     this.ptyProc.write(normalized);
     await delay(120);
     if (!this.ptyProc) return;
     this.ptyProc.write('\r');
 
-    // Safety net: if we still haven't seen our injection echoed back after a
-    // grace period, retry the submit Enter once. Some TUI states (warmup,
-    // welcome modal) swallow the first Enter.
+    // Safety net: retry Enter only while the terminal is idle. This avoids
+    // submitting a human's half-written next prompt after Codex/TUI warmup.
     setTimeout(() => {
-      if (this.pendingWechatInjection !== null && this.ptyProc) {
+      const stillPending = this.pendingWechatInjection?.id === injection.id;
+      const terminalIdle = Date.now() - this.lastStdinAtMs >= TERMINAL_IDLE_BEFORE_INJECT_MS;
+      if (stillPending && terminalIdle && this.ptyProc) {
         this.ptyProc.write('\r');
       }
     }, 2500);
+  }
+
+  private createWechatInjection(text: string): PendingWechatInjection {
+    const id = `${Date.now().toString(36)}-${++this.injectionCounter}`;
+    return {
+      id,
+      text,
+      startedAtMs: Date.now(),
+    };
+  }
+
+  private scheduleDispatch(delayMs: number): void {
+    if (this.dispatchTimer) return;
+    this.dispatchTimer = setTimeout(() => {
+      this.dispatchTimer = null;
+      this.maybeDispatchQueued();
+    }, Math.max(50, delayMs));
+    this.dispatchTimer.unref?.();
+  }
+
+  private clearDispatchTimer(): void {
+    if (this.dispatchTimer) {
+      clearTimeout(this.dispatchTimer);
+      this.dispatchTimer = null;
+    }
   }
 
   // ── Session log polling ──
@@ -335,6 +394,7 @@ export class NativeCodexBridge {
       this.threadId = candidate.threadId;
       this.sessionReadOffset = 0;
       this.sessionPartialLine = '';
+      logger.info('Bound Codex session file', { path: candidate.path, threadId: candidate.threadId });
     }
   }
 
@@ -344,9 +404,9 @@ export class NativeCodexBridge {
       if (!this.sessionFilePath) return;
     }
 
-    let content: string;
+    let size: number;
     try {
-      content = readFileSync(this.sessionFilePath, 'utf8');
+      size = statSync(this.sessionFilePath).size;
     } catch {
       this.sessionFilePath = null;
       this.sessionReadOffset = 0;
@@ -354,15 +414,41 @@ export class NativeCodexBridge {
       return;
     }
 
-    if (content.length < this.sessionReadOffset) {
-      this.sessionReadOffset = 0;
+    if (size < this.sessionReadOffset) {
+      logger.warn('Codex session log shrank; skipping existing content to avoid replay', {
+        path: this.sessionFilePath,
+        oldOffset: this.sessionReadOffset,
+        newSize: size,
+      });
+      this.sessionReadOffset = size;
       this.sessionPartialLine = '';
+      return;
     }
 
-    const newData = content.slice(this.sessionReadOffset);
-    this.sessionReadOffset = content.length;
+    if (size === this.sessionReadOffset) return;
 
-    if (!newData) return;
+    const readOffset = this.sessionReadOffset;
+    const length = size - readOffset;
+    const buffer = Buffer.allocUnsafe(length);
+    let fd: number | null = null;
+    let bytesRead = 0;
+    try {
+      fd = openSync(this.sessionFilePath, 'r');
+      bytesRead = readSync(fd, buffer, 0, length, readOffset);
+    } catch {
+      this.sessionFilePath = null;
+      this.sessionReadOffset = 0;
+      this.sessionPartialLine = '';
+      return;
+    } finally {
+      if (fd !== null) {
+        try { closeSync(fd); } catch { /* best effort */ }
+      }
+    }
+    this.sessionReadOffset = readOffset + bytesRead;
+    if (bytesRead <= 0) return;
+
+    const newData = buffer.subarray(0, bytesRead).toString('utf8');
 
     const combined = this.sessionPartialLine + newData;
     const lines = combined.split('\n');
@@ -416,26 +502,54 @@ export class NativeCodexBridge {
     if (payloadType === 'user_message') {
       if (!this.activeTurn) return;
       const message = typeof payload.message === 'string' ? payload.message : '';
+      const injectionId = extractWechatInjectionId(message);
+      const matchedPendingInjection =
+        this.pendingWechatInjection !== null &&
+        wechatInjectionMatches(message, this.pendingWechatInjection);
 
       // If this matches our pending WeChat injection, the turn is WeChat-sourced.
-      if (
-        this.pendingWechatInjection !== null &&
-        textsMatch(message, this.pendingWechatInjection)
-      ) {
+      if (matchedPendingInjection) {
         this.activeTurn.source = 'wechat';
         this.pendingWechatInjection = null;
+      } else if (injectionId) {
+        this.activeTurn.source = 'wechat';
+        logger.warn('Observed stale or unknown WeChat injection marker', { injectionId });
       } else {
+        if (this.pendingWechatInjection !== null) {
+          logger.warn('Terminal turn arrived while WeChat injection was pending; requeueing injection', {
+            injectionAgeMs: Date.now() - this.pendingWechatInjection.startedAtMs,
+          });
+          this.wechatQueue.unshift(this.pendingWechatInjection.text);
+          this.pendingWechatInjection = null;
+        }
         this.activeTurn.source = 'terminal';
         if (message.trim()) {
-          this.events.onWechatReply(`⌨️ 终端输入：${message}`);
+          const handled = this.events.onTerminalUserMessage?.(message) ?? false;
+          if (handled) {
+            this.activeTurn.suppressWechatOutput = true;
+          }
+          if (!handled) {
+            logger.info('Forwarding terminal input to WeChat', { messageLength: message.length });
+            this.events.onWechatReply(`⌨️ 终端输入：${message}`);
+          }
         }
       }
 
       // Flush any commentary that arrived before source was resolved.
-      for (const c of this.activeTurn.pendingCommentary) {
-        this.events.onWechatReply(`💭 ${c}`);
+      if (!this.activeTurn.suppressWechatOutput) {
+        for (const c of this.activeTurn.pendingCommentary) {
+          void this.emitCommentary(this.activeTurn, c);
+        }
       }
       this.activeTurn.pendingCommentary = [];
+      if (
+        this.activeTurn.texts.length > 0 &&
+        !this.activeTurn.finalEmitted &&
+        !this.activeTurn.suppressWechatOutput &&
+        (this.activeTurn.source === 'wechat' || this.activeTurn.source === 'terminal')
+      ) {
+        void this.emitResolvedTurnFinal(this.activeTurn);
+      }
       return;
     }
 
@@ -445,23 +559,31 @@ export class NativeCodexBridge {
       if (!message || !this.activeTurn) return;
       if (phase === 'final_answer') {
         this.activeTurn.texts.push(message);
+        if (
+          !this.activeTurn.finalEmitted &&
+          !this.activeTurn.suppressWechatOutput &&
+          (this.activeTurn.source === 'wechat' || this.activeTurn.source === 'terminal')
+        ) {
+          void this.emitResolvedTurnFinal(this.activeTurn);
+        }
       } else if (phase === 'commentary') {
+        if (this.activeTurn.suppressWechatOutput) return;
         if (this.activeTurn.source === 'unknown') {
           this.activeTurn.pendingCommentary.push(message);
         } else {
-          this.events.onWechatReply(`💭 ${message}`);
+          void this.emitCommentary(this.activeTurn, message);
         }
       }
       return;
     }
 
     if (payloadType === 'task_complete' || payloadType === 'turn_aborted') {
-      this.completeActiveTurn(payloadType === 'turn_aborted' ? 'aborted' : 'complete');
+      void this.completeActiveTurn(payloadType === 'turn_aborted' ? 'aborted' : 'complete');
       return;
     }
   }
 
-  private completeActiveTurn(reason: BridgeTurnReason): void {
+  private async completeActiveTurn(reason: BridgeTurnReason): Promise<void> {
     const turn = this.activeTurn;
     this.activeTurn = null;
 
@@ -471,31 +593,88 @@ export class NativeCodexBridge {
     }
 
     const source = turn.source;
+
+    try {
+      if (turn.suppressWechatOutput) {
+        logger.info('Suppressing Codex output for handled terminal command', { turnId: turn.turnId });
+      } else if (source === 'wechat' || source === 'terminal') {
+        if (reason === 'aborted') {
+          if (source === 'wechat') this.events.onError('Turn aborted');
+        } else {
+          await this.emitResolvedTurnFinal(turn);
+        }
+        if (source === 'wechat') {
+          this.events.onWechatTurnComplete();
+        }
+      } else if (reason === 'complete') {
+        const { visibleText, attachments } = this.parseTurnOutput(turn);
+        logger.warn('Completing Codex turn with unknown source', {
+          turnId: turn.turnId,
+          finalTextLength: visibleText.length,
+          commentaryCount: turn.pendingCommentary.length,
+        });
+        for (const c of turn.pendingCommentary) {
+          await this.emitCommentary(turn, c);
+        }
+        if (visibleText) {
+          await this.events.onWechatReply(`⚠️ 未识别来源的 Codex 输出：\n${visibleText}`);
+        }
+        for (const a of attachments) {
+          await this.events.onWechatAttachment(a);
+        }
+      }
+    } catch (err) {
+      logger.warn('Failed while finalizing Codex turn output', {
+        turnId: turn.turnId,
+        source,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    try {
+      await this.events.onTurnFinalized?.({ source, reason });
+    } finally {
+      this.maybeDispatchQueued();
+    }
+  }
+
+  private parseTurnOutput(turn: ActiveTurn): {
+    visibleText: string;
+    attachments: WechatAttachment[];
+  } {
     const texts = turn.texts.map((t) => t.trim()).filter(Boolean);
     const rawFinal = texts.join('\n\n');
     const parsed = parseWechatAttachments(rawFinal);
-    const { visibleText } = parsed;
-    const attachments = parsed.attachments.map((a) => ({
-      kind: a.kind,
-      path: isAbsolute(a.path) ? a.path : resolvePath(this.cwd, a.path),
-    }));
+    return {
+      visibleText: parsed.visibleText,
+      attachments: parsed.attachments.map((a) => ({
+        kind: a.kind,
+        path: isAbsolute(a.path) ? a.path : resolvePath(this.cwd, a.path),
+      })),
+    };
+  }
 
-    // Only emit to WeChat for resolved turns. An 'unknown' source means the
-    // turn had no user_message (internal/background turn) — silently ignore.
-    if (source === 'wechat' || source === 'terminal') {
-      if (reason === 'aborted') {
-        if (source === 'wechat') this.events.onError('Turn aborted');
-      } else {
-        if (visibleText) this.events.onWechatReply(visibleText);
-        for (const a of attachments) this.events.onWechatAttachment(a);
-      }
-      if (source === 'wechat') {
-        this.events.onWechatTurnComplete();
-      }
+  private async emitCommentary(turn: ActiveTurn, message: string): Promise<void> {
+    if (turn.source !== 'wechat' && turn.source !== 'terminal') return;
+    await this.events.onWechatReply(`💭 ${message}`);
+  }
+
+  private emitResolvedTurnFinal(turn: ActiveTurn): Promise<void> {
+    if (turn.finalEmitted) {
+      return turn.finalDelivery ?? Promise.resolve();
     }
 
-    this.events.onTurnFinalized?.({ source, reason });
-    this.maybeDispatchQueued();
+    turn.finalEmitted = true;
+    const delivery = (async () => {
+      const { visibleText, attachments } = this.parseTurnOutput(turn);
+      if (visibleText) await this.events.onWechatReply(visibleText);
+      for (const a of attachments) {
+        await this.events.onWechatAttachment(a);
+      }
+    })();
+
+    turn.finalDelivery = delivery;
+    return delivery;
   }
 }
 
@@ -505,15 +684,29 @@ function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Compare two user-message texts loosely: whitespace-normalised and trimmed.
-// We use this to recognise when Codex's `user_message` event echoes back a
-// message we injected via PTY (so we can tag the turn as WeChat-sourced).
-function textsMatch(a: string, b: string): boolean {
-  const norm = (s: string) => s.replace(/\s+/g, ' ').trim();
-  const na = norm(a);
-  const nb = norm(b);
-  if (!na || !nb) return false;
-  return na === nb;
+function extractWechatInjectionId(text: string): string | null {
+  const match = text.match(/<!--\s*wcb-injection:([a-z0-9-]+)\s*-->/i);
+  return match?.[1] ?? null;
+}
+
+function sanitizeBridgeInjectionMarkers(text: string): string {
+  return text.replace(/<!--\s*wcb-injection:[a-z0-9-]+\s*-->/gi, '');
+}
+
+function normalizeUserMessageText(text: string): string {
+  return sanitizeBridgeInjectionMarkers(text).replace(/\s+/g, ' ').trim();
+}
+
+function wechatInjectionMatches(message: string, injection: PendingWechatInjection): boolean {
+  const injectionId = extractWechatInjectionId(message);
+  if (injectionId && injectionId === injection.id) return true;
+
+  const normalizedMessage = normalizeUserMessageText(message);
+  if (!normalizedMessage) return false;
+
+  return (
+    normalizedMessage === normalizeUserMessageText(injection.text)
+  );
 }
 
 // Parse a fenced ```wechat-attachments ... ``` block at the end of Codex's
@@ -652,8 +845,20 @@ function sessionMatchesCwd(path: string, cwd: string): boolean {
     const parsed = JSON.parse(firstLine) as Record<string, unknown>;
     if (parsed.type !== 'session_meta') return false;
     const payload = parsed.payload as Record<string, unknown> | undefined;
-    return typeof payload?.cwd === 'string' && payload.cwd === cwd;
+    return (
+      typeof payload?.cwd === 'string' &&
+      normalizePathForCompare(payload.cwd) === normalizePathForCompare(cwd) &&
+      (payload.approval_policy === 'never' || payload.approval_policy === undefined)
+    );
   } catch {
     return false;
+  }
+}
+
+function normalizePathForCompare(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolvePath(path);
   }
 }

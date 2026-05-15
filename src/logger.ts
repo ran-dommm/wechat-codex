@@ -53,14 +53,20 @@ function getLogFilePath(): string {
 }
 
 function writeLogLine(level: string, message: string, data?: unknown): void {
-  ensureLogDir();
-  const timestamp = new Date().toISOString();
-  const parts = [timestamp, level, message];
-  if (data !== undefined) {
-    parts.push(redact(data));
+  try {
+    ensureLogDir();
+    const timestamp = new Date().toISOString();
+    const parts = [timestamp, level, message];
+    if (data !== undefined) {
+      parts.push(redact(data));
+    }
+    const line = parts.join(" ") + "\n";
+    appendFileSync(getLogFilePath(), line, "utf-8");
+  } catch {
+    // Logging must never break bridge control flow. This can happen in
+    // read-only/sandboxed diagnostics even though the daemon normally has
+    // write access to LOG_DIR.
   }
-  const line = parts.join(" ") + "\n";
-  appendFileSync(getLogFilePath(), line, "utf-8");
 }
 
 export const logger = {

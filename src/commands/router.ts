@@ -1,10 +1,19 @@
 import type { Session } from '../session.js';
-import { findSkill } from '../codex/skill-scanner.js';
 import { logger } from '../logger.js';
-import { handleHelp, handleClear, handleModel, handleMode, handleCwd, handleStatus, handleSkills, handleUnknown, handlePermissionAlias } from './handlers.js';
+import {
+  handleCodexAuth,
+  handleHelp,
+  handleClear,
+  handleModel,
+  handleMode,
+  handleCwd,
+  handleStatus,
+  handleSkills,
+  handleUnknown,
+  handlePermissionAlias,
+} from './handlers.js';
 
 export interface CommandContext {
-  accountId: string;
   session: Session;
   updateSession: (partial: Partial<Session>) => void;
   clearSession: () => Session;
@@ -16,6 +25,7 @@ export interface CommandResult {
   handled: boolean;
   codexPrompt?: string; // If set, this text should be sent to Codex
   nowPrompt?: string; // If set, interrupt current work and run this immediately
+  codexAuthProfile?: string; // If set, switch auth profile in main runtime
 }
 
 /**
@@ -28,6 +38,7 @@ export interface CommandResult {
  *   /cwd <path> - Update the working directory
  *   /mode <mode> - Update execution mode
  *   /status   - Show current session info
+ *   /codex-auth - Show/save/switch Codex auth profile
  *   /now <text> - Interrupt current turn, clear queue, and run text now
  *   /skills   - List all installed skills
  *   /<skill>  - Invoke a skill by name (args are forwarded to Claude)
@@ -60,6 +71,8 @@ export function routeCommand(ctx: CommandContext): CommandResult {
       return handlePermissionAlias();
     case 'status':
       return handleStatus(ctx);
+    case 'codex-auth':
+      return handleCodexAuth(args);
     case 'now':
       return {
         handled: true,

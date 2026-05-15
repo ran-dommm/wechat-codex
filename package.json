@@ -3,12 +3,17 @@
   "version": "1.0.0",
   "description": "WeChat-Codex bridge with interactive terminal REPL and WeChat dual input",
   "type": "module",
+  "bin": {
+    "wechat-codex": "./dist/src/main.js"
+  },
   "scripts": {
     "build": "tsc",
     "postinstall": "npm run build",
     "start": "node dist/src/main.js",
     "dev": "tsc --watch",
-    "setup": "node dist/src/main.js setup"
+    "setup": "node dist/src/main.js setup",
+    "codex-auth": "node dist/src/main.js codex-auth",
+    "cleanup-legacy": "node dist/src/main.js cleanup-legacy"
   },
   "dependencies": {
     "node-pty": "^1.1.0",

@@ -3,6 +3,7 @@ import { existsSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { scanAllSkills, findSkill, type SkillInfo } from '../codex/skill-scanner.js';
+import { getCurrentAuthProfile, listAuthProfiles, saveCurrentAuthProfile, validateProfileName } from '../codex/auth-profiles.js';
 
 const HELP_TEXT = `可用命令：
 
@@ -11,6 +12,7 @@ const HELP_TEXT = `可用命令：
   /model <名称>     切换 Codex 模型
   /cwd <路径>       切换工作目录
   /mode <模式>      切换执行模式
+  /codex-auth       查看/保存/切换 Codex 认证账号
   /status           查看当前会话状态
   /now <内容>       中断当前回合并清空排队，立即执行内容
   /skills           列出已安装的 skills
@@ -127,16 +129,99 @@ export function handlePermissionAlias(): CommandResult {
 export function handleStatus(ctx: CommandContext): CommandResult {
   const s = ctx.session;
   const mode = s.mode ?? 'workspace';
+  const currentAuth = getCurrentAuthProfile();
   const lines = [
     '📊 会话状态',
     '',
     `工作目录: ${s.workingDirectory}`,
     `模型: ${s.model ?? '默认'}`,
     `执行模式: ${mode}`,
+    `Codex Auth: ${currentAuth.name ?? (currentAuth.exists ? '未纳入 profile 管理' : '未登录')}`,
     `线程ID: ${s.threadId ?? '无'}`,
     `状态: ${s.state}`,
   ];
   return { reply: lines.join('\n'), handled: true };
+}
+
+export function handleCodexAuth(args: string): CommandResult {
+  const [subcommandRaw, profileNameRaw] = args.split(/\s+/, 2);
+  const subcommand = (subcommandRaw || 'current').toLowerCase();
+
+  switch (subcommand) {
+    case 'current': {
+      const current = getCurrentAuthProfile();
+      if (!current.exists) {
+        return { reply: '当前未找到 Codex auth.json，请先在终端运行 codex login。', handled: true };
+      }
+      return {
+        reply: [
+          `当前 Codex Auth: ${current.name ?? '未纳入 profile 管理'}`,
+          `auth.json: ${current.isSymlink ? '软链接' : '普通文件'}`,
+          current.targetPath ? `目标: ${current.targetPath}` : '',
+        ].filter(Boolean).join('\n'),
+        handled: true,
+      };
+    }
+    case 'list': {
+      const profiles = listAuthProfiles();
+      if (profiles.length === 0) {
+        return { reply: '未找到 Codex auth profiles。请先在终端运行 npm run codex-auth save <name>。', handled: true };
+      }
+      const lines = profiles.map((p) => `${p.isCurrent ? '*' : ' '} ${p.name}`);
+      return { reply: `Codex Auth Profiles:\n${lines.join('\n')}`, handled: true };
+    }
+    case 'use': {
+      if (!profileNameRaw) {
+        return { reply: '用法: /codex-auth use <name>', handled: true };
+      }
+      try {
+        const profileName = validateProfileName(profileNameRaw);
+        return {
+          handled: true,
+          codexAuthProfile: profileName,
+        };
+      } catch (err) {
+        return { reply: err instanceof Error ? err.message : String(err), handled: true };
+      }
+    }
+    case 'save': {
+      if (!profileNameRaw) {
+        return { reply: '用法: /codex-auth save <name>', handled: true };
+      }
+      try {
+        const profileName = validateProfileName(profileNameRaw);
+        const result = saveCurrentAuthProfile(profileName);
+        const lines = [
+          result.changed
+            ? `✅ 已保存当前 Codex 凭证为: ${profileName}`
+            : `当前 Codex 凭证已经是: ${profileName}`,
+        ];
+        if (result.profilePath) {
+          lines.push(`profile: ${result.profilePath}`);
+        }
+        return { reply: lines.join('\n'), handled: true };
+      } catch (err) {
+        return { reply: `⚠️ 保存 Codex 凭证失败：${err instanceof Error ? err.message : String(err)}`, handled: true };
+      }
+    }
+    case 'import':
+    case 'delete':
+      return {
+        reply: `微信端不开放 /codex-auth ${subcommand}，请在终端使用 npm run codex-auth ${subcommand}。`,
+        handled: true,
+      };
+    default:
+      return {
+        reply: [
+          '用法:',
+          '  /codex-auth current',
+          '  /codex-auth list',
+          '  /codex-auth save <name>',
+          '  /codex-auth use <name>',
+        ].join('\n'),
+        handled: true,
+      };
+  }
 }
 
 export function handleSkills(): CommandResult {

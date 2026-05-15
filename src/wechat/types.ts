@@ -114,6 +114,11 @@ export interface SendMessageReq {
   msg: OutboundMessage;
 }
 
+export interface SendMessageResp {
+  ret?: number;
+  retmsg?: string;
+}
+
 export interface GetUploadUrlReq {
   file_type: string;
   file_size: number;

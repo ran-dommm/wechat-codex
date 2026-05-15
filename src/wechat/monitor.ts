@@ -1,6 +1,9 @@
 import { WeChatApi } from './api.js';
 import { loadSyncBuf, saveSyncBuf } from './sync-buf.js';
 import { logger } from '../logger.js';
+import { DATA_DIR } from '../constants.js';
+import { loadJson, saveJson } from '../store.js';
+import { join } from 'node:path';
 import type { WeixinMessage } from './types.js';
 
 const SESSION_EXPIRED_ERRCODE = -14;
@@ -8,6 +11,7 @@ const SESSION_EXPIRED_PAUSE_MS = 60 * 60 * 1000;
 const BACKOFF_THRESHOLD = 3;
 const BACKOFF_LONG_MS = 30_000;
 const BACKOFF_SHORT_MS = 3_000;
+const RECENT_MSG_IDS_PATH = join(DATA_DIR, 'recent-message-ids.json');
 
 export interface MonitorCallbacks {
   onMessage: (msg: WeixinMessage) => Promise<void>;
@@ -16,8 +20,22 @@ export interface MonitorCallbacks {
 
 export function createMonitor(api: WeChatApi, callbacks: MonitorCallbacks) {
   const controller = new AbortController();
-  const recentMsgIds = new Set<number>();
   const MAX_MSG_IDS = 1000;
+  const recentMsgIds = new Set<number>(loadJson<number[]>(RECENT_MSG_IDS_PATH, []));
+
+  function rememberMessageId(messageId: number): void {
+    recentMsgIds.add(messageId);
+    if (recentMsgIds.size > MAX_MSG_IDS) {
+      const iter = recentMsgIds.values();
+      const toDelete: number[] = [];
+      for (let i = 0; i < MAX_MSG_IDS / 2; i++) {
+        const { value } = iter.next();
+        if (value !== undefined) toDelete.push(value);
+      }
+      for (const id of toDelete) recentMsgIds.delete(id);
+    }
+    saveJson(RECENT_MSG_IDS_PATH, Array.from(recentMsgIds));
+  }
 
   async function run(): Promise<void> {
     let consecutiveFailures = 0;
@@ -53,16 +71,7 @@ export function createMonitor(api: WeChatApi, callbacks: MonitorCallbacks) {
               continue;
             }
             if (msg.message_id) {
-              recentMsgIds.add(msg.message_id);
-              if (recentMsgIds.size > MAX_MSG_IDS) {
-                const iter = recentMsgIds.values();
-                const toDelete: number[] = [];
-                for (let i = 0; i < MAX_MSG_IDS / 2; i++) {
-                  const { value } = iter.next();
-                  if (value !== undefined) toDelete.push(value);
-                }
-                for (const id of toDelete) recentMsgIds.delete(id);
-              }
+              rememberMessageId(msg.message_id);
             }
             try {
               await callbacks.onMessage(msg);

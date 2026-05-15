@@ -189,6 +189,7 @@ The experiment is still running; nothing to send yet.
 - `/mode <plan|workspace|danger>`：切换运行模式（重启服务后生效）
 - `/now <内容>`：中断当前处理并立刻执行这条内容
 - `/clear`：清空当前会话
+- `/codex-auth current|list|save <name>|use <name>`：查看、保存或切换 Codex 认证账号
 - `/skills`：列出可用 skills
 
 ## 6. 配置文件说明
@@ -223,8 +224,39 @@ export WCB_DATA_DIR=/your/path
 目录内会自动创建：
 
 - `config.env`
+- `wechat-account.json`
+- `session.json`
+- `codex-auth/`
 - `logs/`
 - `tmp/`
+
+### 6.1 Codex Auth Profiles
+
+`wechat-codex` 只切换 `~/.codex/auth.json`，不会复制 `config.toml`、`AGENTS.md`、history 或 sessions。
+
+```bash
+npm run codex-auth -- current
+npm run codex-auth -- list
+npm run codex-auth -- save personal
+npm run codex-auth -- use personal
+npm run codex-auth -- import work /path/to/auth.json
+npm run codex-auth -- delete work
+```
+
+微信端只开放安全命令：
+
+```text
+/codex-auth current
+/codex-auth list
+/codex-auth save personal
+/codex-auth use personal
+```
+
+迁移到单微信账号结构后，可以显式清理旧目录：
+
+```bash
+npm run cleanup-legacy
+```
 
 ## 7. 常见问题
 

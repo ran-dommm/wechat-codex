@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { createInterface } from 'node:readline';
 import process from 'node:process';
 import { spawnSync } from 'node:child_process';
@@ -5,7 +6,7 @@ import { dirname, join } from 'node:path';
 import { existsSync, mkdirSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 
 import { WeChatApi } from './wechat/api.js';
-import { loadLatestAccount } from './wechat/accounts.js';
+import { loadAccount } from './wechat/accounts.js';
 import { startQrLogin, waitForQrScan } from './wechat/login.js';
 import { createMonitor, type MonitorCallbacks } from './wechat/monitor.js';
 import { createSender } from './wechat/send.js';
@@ -21,6 +22,9 @@ import {
 import { createSessionStore, type Session } from './session.js';
 import { routeCommand, type CommandContext, type CommandResult } from './commands/router.js';
 import { NativeCodexBridge } from './codex/native-bridge.js';
+import type { BridgeTurnSource } from './codex/native-bridge.js';
+import { runCodexAuthCli } from './codex/auth-cli.js';
+import { useAuthProfile } from './codex/auth-profiles.js';
 import { DEFAULT_WORKING_DIRECTORY, loadConfig, saveConfig } from './config.js';
 import { logger } from './logger.js';
 import { dequeueQueuedMessage, enqueueQueuedMessage } from './message-queue.js';
@@ -35,7 +39,7 @@ interface QueuedCodexMessage {
   contextToken: string;
 }
 
-const queuedMessages = new Map<string, QueuedCodexMessage[]>();
+const queuedMessages: QueuedCodexMessage[] = [];
 
 // Per-user pending files. When a user sends one or more file messages via
 // WeChat, we stash them here (on disk) until the user sends a follow-up
@@ -99,6 +103,10 @@ interface WechatRecipient {
   userId: string;
   contextToken: string;
 }
+
+const MAX_DEFERRED_WECHAT_TEXTS = 20;
+const TERMINAL_QUEUE_GRACE_MS = 1500;
+const WECHAT_SEND_INTERVAL_MS = 2500;
 
 function promptUser(question: string, defaultValue?: string): Promise<string> {
   if (!process.stdin.isTTY) {
@@ -189,6 +197,10 @@ function isImageFile(filePath: string): boolean {
   return IMAGE_EXTENSIONS.has(ext);
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 async function runSetup(): Promise<void> {
   mkdirSync(DATA_DIR, { recursive: true });
   const qrPath = join(DATA_DIR, 'qrcode.png');
@@ -250,11 +262,26 @@ async function runSetup(): Promise<void> {
   console.log('\n设置完成！运行 npm start 启动服务');
 }
 
+function runCleanupLegacy(): void {
+  const legacyPaths = [
+    join(DATA_DIR, 'accounts'),
+    join(DATA_DIR, 'sessions'),
+  ];
+  for (const legacyPath of legacyPaths) {
+    if (existsSync(legacyPath)) {
+      rmSync(legacyPath, { recursive: true, force: true });
+      console.log(`已删除: ${legacyPath}`);
+    } else {
+      console.log(`不存在，跳过: ${legacyPath}`);
+    }
+  }
+}
+
 // ── Daemon ──────────────────────────────────────────────────────
 
 async function runDaemon(): Promise<void> {
   const config = loadConfig();
-  const maybeAccount = loadLatestAccount();
+  const maybeAccount = loadAccount();
 
   if (!maybeAccount) {
     console.error('未找到账号，请先运行 npm run setup');
@@ -264,43 +291,131 @@ async function runDaemon(): Promise<void> {
   const account = maybeAccount;
   const api = new WeChatApi(account.botToken, account.baseUrl);
   const sessionStore = createSessionStore();
-  const session = sessionStore.load(account.accountId);
+  const session = sessionStore.load();
   if (session.state === 'processing') {
     session.state = 'idle';
-    sessionStore.save(account.accountId, session);
+    sessionStore.save(session);
   }
   const sender = createSender(api, account.accountId, account.baseUrl, account.botToken);
 
   const cwd = session.workingDirectory || config.workingDirectory;
   ensureUsableDirectory(cwd);
 
-  let lastRecipient: WechatRecipient | null = null;
+  let lastRecipient: WechatRecipient | null = session.lastRecipient ?? null;
   let activeTempFiles: string[] = [];
+  let outgoingWechatSend: Promise<void> = Promise.resolve();
+  let deferredWechatTexts: string[] = [];
+  let queuedDispatchTimer: NodeJS.Timeout | null = null;
+  let lastWechatSendAtMs = 0;
 
-  async function sendTextToWechat(text: string): Promise<void> {
-    if (!lastRecipient) return;
-    try {
-      for (const chunk of splitMessage(text)) {
-        await sender.sendText(lastRecipient.userId, lastRecipient.contextToken, chunk);
+  function enqueueWechatSend(work: () => Promise<void>): Promise<void> {
+    const next = outgoingWechatSend.then(work, work);
+    outgoingWechatSend = next.catch(() => undefined);
+    return next;
+  }
+
+  async function retryWechatSend(label: string, work: () => Promise<void>): Promise<void> {
+    const maxAttempts = 3;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await work();
+        return;
+      } catch (err) {
+        lastError = err;
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (attempt >= maxAttempts) break;
+        logger.warn('WeChat send failed, retrying', { label, attempt, error: errMsg });
+        await sleep(500 * attempt);
       }
-    } catch (err) {
-      logger.warn('Failed to send to WeChat', { error: err instanceof Error ? err.message : String(err) });
+    }
+    const errMsg = lastError instanceof Error ? lastError.message : String(lastError);
+    throw new Error(`${label} failed after ${maxAttempts} attempts: ${errMsg}`);
+  }
+
+  async function waitForWechatSendSlot(): Promise<void> {
+    const elapsed = Date.now() - lastWechatSendAtMs;
+    if (lastWechatSendAtMs > 0 && elapsed < WECHAT_SEND_INTERVAL_MS) {
+      await sleep(WECHAT_SEND_INTERVAL_MS - elapsed);
     }
   }
 
-  async function sendImageToWechat(imagePath: string): Promise<void> {
-    if (!lastRecipient) return;
-    try {
-      await sender.sendImage(lastRecipient.userId, lastRecipient.contextToken, imagePath);
-    } catch (err) {
-      logger.warn('Failed to send image to WeChat', { error: err instanceof Error ? err.message : String(err) });
+  async function sendTextNow(text: string, recipient: WechatRecipient): Promise<void> {
+    for (const chunk of splitMessage(text)) {
+      await waitForWechatSendSlot();
+      await retryWechatSend('send text', () => sender.sendText(recipient.userId, recipient.contextToken, chunk));
+      lastWechatSendAtMs = Date.now();
     }
+  }
+
+  function rememberDeferredWechatText(text: string): void {
+    deferredWechatTexts.push(text);
+    if (deferredWechatTexts.length > MAX_DEFERRED_WECHAT_TEXTS) {
+      deferredWechatTexts = deferredWechatTexts.slice(-MAX_DEFERRED_WECHAT_TEXTS);
+    }
+  }
+
+  function shouldDeferFailedWechatText(text: string): boolean {
+    const trimmed = text.trimStart();
+    return !trimmed.startsWith('💭') && !trimmed.startsWith('⌨️ 终端输入：');
+  }
+
+  async function sendTextToWechat(text: string): Promise<void> {
+    const recipient = lastRecipient;
+    if (!recipient) {
+      rememberDeferredWechatText(text);
+      logger.warn('Deferring text: no WeChat recipient yet', {
+        textLength: text.length,
+        deferredCount: deferredWechatTexts.length,
+      });
+      return;
+    }
+    await enqueueWechatSend(async () => {
+      try {
+        await sendTextNow(text, recipient);
+      } catch (err) {
+        logger.warn('Failed to send to WeChat', { error: err instanceof Error ? err.message : String(err) });
+        if (shouldDeferFailedWechatText(text)) {
+          rememberDeferredWechatText(text);
+        }
+      }
+    });
+  }
+
+  function setLastRecipient(recipient: WechatRecipient): void {
+    lastRecipient = recipient;
+    session.lastRecipient = recipient;
+    sessionStore.save(session);
+    flushDeferredWechatTexts();
+  }
+
+  function flushDeferredWechatTexts(): void {
+    if (!lastRecipient || deferredWechatTexts.length === 0) return;
+    const pending = deferredWechatTexts;
+    deferredWechatTexts = [];
+    void sendTextToWechat(`（以下为此前因没有微信收件人而暂存的终端同步消息）\n\n${pending.join('\n\n')}`);
+  }
+
+  async function sendImageToWechat(imagePath: string): Promise<void> {
+    const recipient = lastRecipient;
+    if (!recipient) {
+      logger.warn('Drop image: no WeChat recipient yet', { imagePath });
+      return;
+    }
+    await enqueueWechatSend(async () => {
+      try {
+        await retryWechatSend('send image', () => sender.sendImage(recipient.userId, recipient.contextToken, imagePath));
+      } catch (err) {
+        logger.warn('Failed to send image to WeChat', { error: err instanceof Error ? err.message : String(err) });
+      }
+    });
   }
 
   async function sendAttachmentToWechat(
     attachment: { kind: 'image' | 'file' | 'voice' | 'video'; path: string },
   ): Promise<void> {
-    if (!lastRecipient) {
+    const recipient = lastRecipient;
+    if (!recipient) {
       logger.warn('Drop attachment: no WeChat recipient yet', { attachment });
       return;
     }
@@ -309,22 +424,31 @@ async function runDaemon(): Promise<void> {
       await sendTextToWechat(`⚠️ 无法发送附件（文件不存在）：${attachment.path}`);
       return;
     }
-    try {
-      const { userId, contextToken } = lastRecipient;
-      if (attachment.kind === 'image') {
-        await sender.sendImage(userId, contextToken, attachment.path);
-      } else if (attachment.kind === 'file') {
-        await sender.sendFile(userId, contextToken, attachment.path);
-      } else if (attachment.kind === 'voice') {
-        await sender.sendVoice(userId, contextToken, attachment.path);
-      } else if (attachment.kind === 'video') {
-        await sender.sendVideo(userId, contextToken, attachment.path);
+    await enqueueWechatSend(async () => {
+      try {
+        const { userId, contextToken } = recipient;
+        if (attachment.kind === 'image') {
+          await retryWechatSend('send image attachment', () => sender.sendImage(userId, contextToken, attachment.path));
+        } else if (attachment.kind === 'file') {
+          await retryWechatSend('send file attachment', () => sender.sendFile(userId, contextToken, attachment.path));
+        } else if (attachment.kind === 'voice') {
+          await retryWechatSend('send voice attachment', () => sender.sendVoice(userId, contextToken, attachment.path));
+        } else if (attachment.kind === 'video') {
+          await retryWechatSend('send video attachment', () => sender.sendVideo(userId, contextToken, attachment.path));
+        }
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        logger.warn('Failed to send attachment to WeChat', { attachment, error: errMsg });
+        try {
+          await sendTextNow(`⚠️ 发送附件失败 (${attachment.kind}): ${attachment.path}\n${errMsg.slice(0, 400)}`, recipient);
+        } catch (fallbackErr) {
+          logger.warn('Failed to send attachment error notice to WeChat', {
+            attachment,
+            error: fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr),
+          });
+        }
       }
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      logger.warn('Failed to send attachment to WeChat', { attachment, error: errMsg });
-      await sendTextToWechat(`⚠️ 发送附件失败 (${attachment.kind}): ${attachment.path}\n${errMsg.slice(0, 400)}`);
-    }
+    });
   }
 
   async function sendWechatMessageToCodex(
@@ -334,8 +458,8 @@ async function runDaemon(): Promise<void> {
     contextToken: string,
   ): Promise<void> {
     session.state = 'processing';
-    sessionStore.save(account.accountId, session);
-    lastRecipient = { userId: fromUserId, contextToken };
+    sessionStore.save(session);
+    setLastRecipient({ userId: fromUserId, contextToken });
 
     const tempFiles: string[] = [];
     let prompt = userText.trim();
@@ -356,7 +480,7 @@ async function runDaemon(): Promise<void> {
 
         if (prepared.immediateReply) {
           session.state = 'idle';
-          sessionStore.save(account.accountId, session);
+          sessionStore.save(session);
           await sendTextToWechat(prepared.immediateReply);
           cleanupTempFiles(tempFiles);
           return;
@@ -372,7 +496,7 @@ async function runDaemon(): Promise<void> {
 
       if (!prompt) {
         session.state = 'idle';
-        sessionStore.save(account.accountId, session);
+        sessionStore.save(session);
         await sendTextToWechat('⚠️ 未提取到可发送给 Codex 的内容，请重试。');
         cleanupTempFiles(tempFiles);
         return;
@@ -383,7 +507,7 @@ async function runDaemon(): Promise<void> {
       await bridge.sendWechatTurn(prompt, imagePaths.length ? imagePaths : undefined);
     } catch (err) {
       session.state = 'idle';
-      sessionStore.save(account.accountId, session);
+      sessionStore.save(session);
       cleanupTempFiles(tempFiles);
       activeTempFiles = [];
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -393,17 +517,63 @@ async function runDaemon(): Promise<void> {
   }
 
   function processNextQueued(): void {
-    const next = dequeueQueuedMessage(queuedMessages, account.accountId);
+    if (queuedDispatchTimer) {
+      clearTimeout(queuedDispatchTimer);
+      queuedDispatchTimer = null;
+    }
+    const next = dequeueQueuedMessage(queuedMessages);
     if (next) {
-      logger.info('Processing queued message', { accountId: account.accountId });
+      logger.info('Processing queued message');
       void sendWechatMessageToCodex(next.userText, next.media, next.fromUserId, next.contextToken);
     }
   }
 
-  function clearQueuedMessages(accountId: string): number {
-    const count = queuedMessages.get(accountId)?.length ?? 0;
-    queuedMessages.delete(accountId);
+  function clearQueuedMessages(): number {
+    const count = queuedMessages.length;
+    queuedMessages.length = 0;
     return count;
+  }
+
+  function scheduleProcessNextQueued(source: BridgeTurnSource): void {
+    if (queuedDispatchTimer) return;
+    const delayMs = source === 'terminal' ? TERMINAL_QUEUE_GRACE_MS : 0;
+    if (delayMs === 0) {
+      processNextQueued();
+      return;
+    }
+    queuedDispatchTimer = setTimeout(() => {
+      queuedDispatchTimer = null;
+      processNextQueued();
+    }, delayMs);
+    queuedDispatchTimer.unref?.();
+  }
+
+  async function switchCodexAuthProfile(
+    profileName: string,
+    fromUserId: string,
+    contextToken: string,
+  ): Promise<void> {
+    if (bridge.isBusy) {
+      await sender.sendText(fromUserId, contextToken, '⚠️ Codex 正在处理任务，暂不能切换认证账号。请等待完成，或用 /now 中断后再切换。');
+      return;
+    }
+
+    try {
+      const result = useAuthProfile(profileName);
+      await bridge.restart(session.workingDirectory || config.workingDirectory);
+      const lines = [
+        `✅ Codex 认证账号已切换为: ${profileName}`,
+        '已重启 Codex 会话。配置文件、AGENTS.md 和当前工作目录保持不变。',
+      ];
+      if (result.backupPath) {
+        lines.push(`原 auth.json 已备份: ${result.backupPath}`);
+      }
+      await sender.sendText(fromUserId, contextToken, lines.join('\n'));
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logger.error('Failed to switch Codex auth profile', { profileName, error: errMsg });
+      await sender.sendText(fromUserId, contextToken, `⚠️ Codex 认证账号切换失败：${errMsg.slice(0, 500)}`);
+    }
   }
 
   // ── Native Codex Bridge ──
@@ -411,27 +581,50 @@ async function runDaemon(): Promise<void> {
   const mode = (session.mode ?? config.mode ?? 'workspace') as 'plan' | 'workspace' | 'danger';
   const bridge = new NativeCodexBridge(cwd, {
     onWechatReply: (text) => {
-      void sendTextToWechat(text);
+      return sendTextToWechat(text);
     },
     onWechatAttachment: (attachment) => {
-      void sendAttachmentToWechat(attachment);
+      return sendAttachmentToWechat(attachment);
     },
-    onTurnFinalized: () => {
+    onTurnFinalized: ({ source }) => {
       if (activeTempFiles.length > 0 || session.state !== 'idle') {
         session.state = 'idle';
-        sessionStore.save(account.accountId, session);
+        sessionStore.save(session);
       }
       if (activeTempFiles.length > 0) {
         cleanupTempFiles(activeTempFiles);
         activeTempFiles = [];
       }
-      processNextQueued();
+      scheduleProcessNextQueued(source);
     },
     onWechatTurnComplete: () => {
       // Legacy hook retained for compatibility; queue progression and cleanup
       // are handled in onTurnFinalized to cover all completion paths.
     },
     onError: (msg) => logger.error('Bridge error', { error: msg }),
+    onTerminalUserMessage: (message) => {
+      if (!message.trim().startsWith('/')) return false;
+      const result = routeCommand({
+        session,
+        updateSession: (partial) => {
+          Object.assign(session, partial);
+          sessionStore.save(session);
+          if (partial.workingDirectory) {
+            bridge.setCwd(partial.workingDirectory);
+          }
+        },
+        clearSession: () => sessionStore.clear(session),
+        text: message,
+      });
+      const reply = result.codexAuthProfile
+        ? '请使用 npm run codex-auth use <name> 在终端切换 Codex 认证账号，或从微信端发送 /codex-auth use <name>。'
+        : result.reply ?? (result.handled ? '终端命令已处理。' : '');
+      if (reply) {
+        void sendTextToWechat(`⌨️ 终端命令：${message}\n\n${reply}`);
+        return true;
+      }
+      return false;
+    },
     onExit: (code) => {
       logger.info('Codex exited', { code });
       monitor.stop();
@@ -452,21 +645,20 @@ async function runDaemon(): Promise<void> {
       const media = extractFirstSupportedMedia(msg.item_list);
       const isSlashCommand = userText.startsWith('/');
 
-      lastRecipient = { userId: fromUserId, contextToken };
+      setLastRecipient({ userId: fromUserId, contextToken });
 
       // Handle slash commands (work even when busy)
       if (isSlashCommand) {
         const slashCommand = extractSlashCommandName(userText);
         const updateSession = (partial: Partial<Session>) => {
           Object.assign(session, partial);
-          sessionStore.save(account.accountId, session);
+          sessionStore.save(session);
           if (partial.workingDirectory) {
             bridge.setCwd(partial.workingDirectory);
           }
         };
 
         const ctx: CommandContext = {
-          accountId: account.accountId,
           session,
           updateSession,
           clearSession: () => {
@@ -474,14 +666,18 @@ async function runDaemon(): Promise<void> {
             if (dropped > 0) {
               logger.info('Dropped pending files on /clear', { fromUserId, count: dropped });
             }
-            return sessionStore.clear(account.accountId, session);
+            return sessionStore.clear(session);
           },
           text: userText,
         };
 
         const result: CommandResult = routeCommand(ctx);
+        if (result.codexAuthProfile) {
+          await switchCodexAuthProfile(result.codexAuthProfile, fromUserId, contextToken);
+          return;
+        }
         if (result.nowPrompt !== undefined) {
-          const droppedExternal = clearQueuedMessages(account.accountId);
+          const droppedExternal = clearQueuedMessages();
           const { interrupted, clearedQueued: droppedBridge } = bridge.interruptAndClearQueue();
           const prompt = result.nowPrompt.trim();
           const droppedTotal = droppedExternal + droppedBridge;
@@ -529,7 +725,7 @@ async function runDaemon(): Promise<void> {
         }
         if (result.codexPrompt) {
           if (bridge.isBusy) {
-            const queueLength = enqueueQueuedMessage(queuedMessages, account.accountId, {
+            const queueLength = enqueueQueuedMessage(queuedMessages, {
               userText: result.codexPrompt,
               media,
               fromUserId,
@@ -582,7 +778,7 @@ async function runDaemon(): Promise<void> {
       // Queue if busy
       if (bridge.isBusy) {
         if (!isSlashCommand && (userText || media)) {
-          const queueLength = enqueueQueuedMessage(queuedMessages, account.accountId, {
+          const queueLength = enqueueQueuedMessage(queuedMessages, {
             userText,
             media,
             fromUserId,
@@ -644,6 +840,10 @@ if (command === 'setup') {
     console.error('设置失败:', err);
     process.exit(1);
   });
+} else if (command === 'codex-auth') {
+  runCodexAuthCli(process.argv.slice(3));
+} else if (command === 'cleanup-legacy') {
+  runCleanupLegacy();
 } else {
   runDaemon().catch((err) => {
     logger.error('Daemon start failed', { error: err instanceof Error ? err.message : String(err) });
