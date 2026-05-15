@@ -551,10 +551,3 @@ export function buildCodexPrompt(userText: string, prepared?: PreparedMediaForCo
 
   return parts.join('\n\n').trim();
 }
-
-/**
- * Find the first IMAGE type item in a list.
- */
-export function extractFirstImageUrl(items?: MessageItem[]): MessageItem | undefined {
-  return items?.find((item) => item.type === MessageItemType.IMAGE);
-}

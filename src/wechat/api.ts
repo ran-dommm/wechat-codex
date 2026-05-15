@@ -1,4 +1,3 @@
-import { randomBytes } from 'node:crypto';
 import type {
   GetUpdatesResp,
   SendMessageReq,
@@ -6,13 +5,7 @@ import type {
   GetUploadUrlResp,
 } from './types.js';
 import { logger } from '../logger.js';
-
-const CHANNEL_VERSION = '0.3.0';
-
-function randomWechatUin(): string {
-  const uint32 = randomBytes(4).readUInt32BE(0);
-  return Buffer.from(String(uint32), 'utf-8').toString('base64');
-}
+import { createBotJsonHeaders, WECHAT_CHANNEL_VERSION } from './transport.js';
 
 export class WeChatApi {
   private readonly token: string;
@@ -28,13 +21,7 @@ export class WeChatApi {
   }
 
   private headers(bodyLength: number): Record<string, string> {
-    return {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${this.token}`,
-      'AuthorizationType': 'ilink_bot_token',
-      'X-WECHAT-UIN': randomWechatUin(),
-      'Content-Length': String(bodyLength),
-    };
+    return createBotJsonHeaders(this.token, bodyLength);
   }
 
   private async request<T>(
@@ -46,7 +33,7 @@ export class WeChatApi {
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     const url = `${this.baseUrl}/${path}`;
-    const payload = { ...body, base_info: { channel_version: CHANNEL_VERSION } };
+    const payload = { ...body, base_info: { channel_version: WECHAT_CHANNEL_VERSION } };
     const bodyStr = JSON.stringify(payload);
 
     logger.debug('API request', { url, body: payload });

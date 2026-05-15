@@ -2,20 +2,13 @@ import { readFileSync, statSync } from 'node:fs';
 import { basename } from 'node:path';
 import { createHash, randomBytes, createCipheriv } from 'node:crypto';
 import { logger } from '../logger.js';
+import { CDN_BASE_URL } from './accounts.js';
+import { createBotJsonHeaders, WECHAT_CHANNEL_VERSION } from './transport.js';
 
-function randomWechatUin(): string {
-  const uint32 = randomBytes(4).readUInt32BE(0);
-  return Buffer.from(String(uint32), 'utf-8').toString('base64');
-}
-
-const CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
 const CDN_MAX_RETRIES = 3;
 const SEND_TIMEOUT_MS = 30_000;
 const IMAGE_MAX_SIZE = 20 * 1024 * 1024; // 20 MB
 const FILE_MAX_SIZE = 100 * 1024 * 1024; // 100 MB
-// Mirrors the channel_version CLI-WeChat-Bridge sends with every WeChat API
-// call. Some endpoints (including getuploadurl) reject requests that omit it.
-const CHANNEL_VERSION = '0.3.0';
 
 // Matches wechat-transport in CLI-WeChat-Bridge: 1=image, 2=video, 3=file, 4=voice.
 const MEDIA_TYPE_IMAGE = 1;
@@ -69,17 +62,11 @@ async function getUploadUrl(
     const body = JSON.stringify({
       ...params,
       no_need_thumb: true,
-      base_info: { channel_version: CHANNEL_VERSION },
+      base_info: { channel_version: WECHAT_CHANNEL_VERSION },
     });
     const res = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`,
-        'AuthorizationType': 'ilink_bot_token',
-        'X-WECHAT-UIN': randomWechatUin(),
-        'Content-Length': String(Buffer.byteLength(body, 'utf-8')),
-      },
+      headers: createBotJsonHeaders(token, Buffer.byteLength(body, 'utf-8')),
       body,
       signal: controller.signal,
     });

@@ -55,8 +55,15 @@ export function handleModel(ctx: CommandContext, args: string): CommandResult {
   if (!args) {
     return { reply: '用法: /model <模型名称>\n例: /model gpt-5.4', handled: true };
   }
+  const previous = ctx.session.model;
   ctx.updateSession({ model: args, threadId: undefined });
-  return { reply: `✅ 模型已切换为: ${args}`, handled: true };
+  return {
+    reply: previous === args
+      ? `当前已经是模型: ${args}`
+      : `✅ 模型已切换为: ${args}\n正在重启 Codex 会话以应用新模型。`,
+    handled: true,
+    restartBridge: previous !== args,
+  };
 }
 
 function expandUserPath(input: string): string {

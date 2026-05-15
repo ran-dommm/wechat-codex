@@ -1,32 +1,28 @@
-import { homedir } from 'node:os';
-import { isAbsolute, join, resolve as resolvePath } from 'node:path';
 import {
   closeSync,
-  existsSync,
   openSync,
-  readFileSync,
   readSync,
-  readdirSync,
-  realpathSync,
   statSync,
 } from 'node:fs';
 import * as pty from 'node-pty';
 import { logger } from '../logger.js';
+import { buildCodexArgs, type CodexSpawnMode } from './args.js';
+import {
+  parseWechatAttachments,
+  resolveWechatAttachmentPaths,
+  type WechatAttachment,
+} from './attachments.js';
+import {
+  parseRateLimitsFromTokenCountPayload,
+  type CodexRateLimitsSnapshot,
+} from './rate-limits.js';
+import { findLatestSessionFile } from './session-log.js';
 
-const CODEX_HOME = process.env.CODEX_HOME || join(homedir(), '.codex');
-const SESSIONS_ROOT = join(CODEX_HOME, 'sessions');
 const SESSION_POLL_INTERVAL_MS = 100;
 const SESSION_DISCOVER_INTERVAL_MS = 200;
 const TERMINAL_IDLE_BEFORE_INJECT_MS = 1500;
 
-export type CodexSpawnMode = 'plan' | 'workspace' | 'danger';
-
-export type AttachmentKind = 'image' | 'file' | 'voice' | 'video';
-
-export interface WechatAttachment {
-  kind: AttachmentKind;
-  path: string;
-}
+export type { CodexSpawnMode } from './args.js';
 
 export interface NativeBridgeEvents {
   onWechatReply: (text: string) => void | Promise<void>;
@@ -36,30 +32,6 @@ export interface NativeBridgeEvents {
   onTerminalUserMessage?: (message: string) => boolean;
   onError: (message: string) => void;
   onExit: (code: number | null) => void;
-}
-
-export interface CodexRateLimitWindow {
-  usedPercent: number;
-  windowMinutes?: number;
-  resetsAt?: number;
-}
-
-export interface CodexRateLimitsSnapshot {
-  planType?: string;
-  primary?: CodexRateLimitWindow;
-  secondary?: CodexRateLimitWindow;
-}
-
-function buildCodexArgs(mode: CodexSpawnMode): string[] {
-  switch (mode) {
-    case 'plan':
-      return ['-s', 'read-only', '-c', 'approval_policy="never"'];
-    case 'danger':
-      return ['--dangerously-bypass-approvals-and-sandbox'];
-    case 'workspace':
-    default:
-      return ['-s', 'workspace-write', '-c', 'approval_policy="never"'];
-  }
 }
 
 type TurnSource = 'unknown' | 'wechat' | 'terminal';
@@ -120,6 +92,7 @@ export class NativeCodexBridge {
     private cwd: string,
     private events: NativeBridgeEvents,
     private mode: CodexSpawnMode = 'workspace',
+    private model?: string,
   ) {}
 
   get isBusy(): boolean {
@@ -168,7 +141,7 @@ export class NativeCodexBridge {
     this.sessionStartedAtMs = Date.now();
     const myGen = ++this.generation;
 
-    const child = pty.spawn('codex', buildCodexArgs(this.mode), {
+    const child = pty.spawn('codex', buildCodexArgs({ mode: this.mode, model: this.model }), {
       name: 'xterm-256color',
       cols: process.stdout.columns || 120,
       rows: process.stdout.rows || 30,
@@ -195,11 +168,11 @@ export class NativeCodexBridge {
     this.startPolling();
   }
 
-  async restart(newCwd?: string, newMode?: CodexSpawnMode): Promise<void> {
+  async restart(newCwd?: string, newMode?: CodexSpawnMode, newModel?: string): Promise<void> {
     if (this.restarting) {
       await this.restarting;
     }
-    this.restarting = this.doRestart(newCwd, newMode);
+    this.restarting = this.doRestart(newCwd, newMode, newModel);
     try {
       await this.restarting;
     } finally {
@@ -207,9 +180,10 @@ export class NativeCodexBridge {
     }
   }
 
-  private async doRestart(newCwd?: string, newMode?: CodexSpawnMode): Promise<void> {
+  private async doRestart(newCwd?: string, newMode?: CodexSpawnMode, newModel?: string): Promise<void> {
     if (newCwd) this.cwd = newCwd;
     if (newMode) this.mode = newMode;
+    if (newModel !== undefined) this.model = newModel || undefined;
 
     this.stopPolling();
     this.sessionFilePath = null;
@@ -648,10 +622,7 @@ export class NativeCodexBridge {
     const parsed = parseWechatAttachments(rawFinal);
     return {
       visibleText: parsed.visibleText,
-      attachments: parsed.attachments.map((a) => ({
-        kind: a.kind,
-        path: isAbsolute(a.path) ? a.path : resolvePath(this.cwd, a.path),
-      })),
+      attachments: resolveWechatAttachmentPaths(parsed.attachments, this.cwd),
     };
   }
 
@@ -710,53 +681,6 @@ function wechatInjectionMatches(message: string, injection: PendingWechatInjecti
   );
 }
 
-// Parse a fenced ```wechat-attachments ... ``` block at the end of Codex's
-// final answer. Matches the convention used by CLI-WeChat-Bridge so users can
-// instruct Codex uniformly across projects.
-//
-// Example:
-//   Here is the chart you requested.
-//
-//   ```wechat-attachments
-//   image /abs/path/to/chart.png
-//   file  /abs/path/to/report.pdf
-//   ```
-const WECHAT_ATTACHMENT_BLOCK_RE =
-  /\n```wechat-attachments[ \t]*\n([\s\S]*?)\n```[ \t]*\s*$/;
-
-function parseWechatAttachments(text: string): {
-  visibleText: string;
-  attachments: WechatAttachment[];
-} {
-  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\s+$/, '');
-  const padded = normalized.startsWith('\n') ? normalized : `\n${normalized}`;
-  const match = padded.match(WECHAT_ATTACHMENT_BLOCK_RE);
-  if (!match) return { visibleText: normalized.trim(), attachments: [] };
-
-  const attachments: WechatAttachment[] = [];
-  const lines = match[1]
-    .split('\n')
-    .map((l) => l.trim())
-    .filter(Boolean);
-  const lineRe = /^(image|file|video|voice)\s+(.+)$/i;
-
-  for (const line of lines) {
-    const m = line.match(lineRe);
-    if (!m) {
-      // Bail on malformed block; treat whole text as visible.
-      return { visibleText: normalized.trim(), attachments: [] };
-    }
-    const kind = m[1].toLowerCase() as AttachmentKind;
-    const path = m[2].trim().replace(/^["']|["']$/g, '');
-    if (!path) continue;
-    attachments.push({ kind, path });
-  }
-
-  const blockStart = padded.length - match[0].length;
-  const visibleText = padded.slice(0, blockStart).trim();
-  return { visibleText, attachments };
-}
-
 function buildEnv(): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
@@ -764,102 +688,4 @@ function buildEnv(): Record<string, string> {
   }
   env.TERM = env.TERM || 'xterm-256color';
   return env;
-}
-
-function parseRateLimitsFromTokenCountPayload(payload: Record<string, unknown>): CodexRateLimitsSnapshot | null {
-  const info = asRecord(payload.info);
-  const rateLimits = asRecord(info?.rate_limits) ?? asRecord(payload.rate_limits);
-  if (!rateLimits) return null;
-
-  const primary = parseRateLimitWindow(asRecord(rateLimits.primary));
-  const secondary = parseRateLimitWindow(asRecord(rateLimits.secondary));
-  const planType = typeof rateLimits.plan_type === 'string' ? rateLimits.plan_type : undefined;
-
-  if (!primary && !secondary && !planType) return null;
-  return {
-    planType,
-    primary: primary ?? undefined,
-    secondary: secondary ?? undefined,
-  };
-}
-
-function parseRateLimitWindow(input: Record<string, unknown> | null): CodexRateLimitWindow | null {
-  if (!input) return null;
-  const usedPercentRaw = input.used_percent;
-  if (typeof usedPercentRaw !== 'number' || Number.isNaN(usedPercentRaw)) return null;
-  const windowMinutes = typeof input.window_minutes === 'number' ? input.window_minutes : undefined;
-  const resetsAt = typeof input.resets_at === 'number' ? input.resets_at : undefined;
-  return {
-    usedPercent: usedPercentRaw,
-    windowMinutes,
-    resetsAt,
-  };
-}
-
-function asRecord(v: unknown): Record<string, unknown> | null {
-  return v && typeof v === 'object' ? (v as Record<string, unknown>) : null;
-}
-
-interface SessionCandidate {
-  path: string;
-  threadId: string;
-  mtimeMs: number;
-}
-
-function findLatestSessionFile(cwd: string, notBeforeMs: number): SessionCandidate | null {
-  if (!existsSync(SESSIONS_ROOT)) return null;
-
-  const files: SessionCandidate[] = [];
-  const walk = (dir: string, depth: number): void => {
-    if (depth > 4) return;
-    let entries: string[];
-    try { entries = readdirSync(dir); } catch { return; }
-    for (const name of entries) {
-      const full = join(dir, name);
-      let st;
-      try { st = statSync(full); } catch { continue; }
-      if (st.isDirectory()) {
-        walk(full, depth + 1);
-      } else if (st.isFile() && name.endsWith('.jsonl') && name.startsWith('rollout-')) {
-        if (st.mtimeMs + 1000 < notBeforeMs) continue;
-        const match = /rollout-.+-([0-9a-f-]{36})\.jsonl$/.exec(name);
-        const threadId = match ? match[1] : '';
-        if (!threadId) continue;
-        if (sessionMatchesCwd(full, cwd)) {
-          files.push({ path: full, threadId, mtimeMs: st.mtimeMs });
-        }
-      }
-    }
-  };
-
-  walk(SESSIONS_ROOT, 0);
-  if (!files.length) return null;
-  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
-  return files[0];
-}
-
-function sessionMatchesCwd(path: string, cwd: string): boolean {
-  try {
-    const content = readFileSync(path, 'utf8');
-    const firstNewline = content.indexOf('\n');
-    const firstLine = firstNewline === -1 ? content : content.slice(0, firstNewline);
-    const parsed = JSON.parse(firstLine) as Record<string, unknown>;
-    if (parsed.type !== 'session_meta') return false;
-    const payload = parsed.payload as Record<string, unknown> | undefined;
-    return (
-      typeof payload?.cwd === 'string' &&
-      normalizePathForCompare(payload.cwd) === normalizePathForCompare(cwd) &&
-      (payload.approval_policy === 'never' || payload.approval_policy === undefined)
-    );
-  } catch {
-    return false;
-  }
-}
-
-function normalizePathForCompare(path: string): string {
-  try {
-    return realpathSync(path);
-  } catch {
-    return resolvePath(path);
-  }
 }

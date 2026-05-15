@@ -10,29 +10,50 @@ export function createSender(api: WeChatApi, botAccountId: string, baseUrl: stri
     return `wcc-${Date.now()}-${++clientCounter}`;
   }
 
-  async function sendText(toUserId: string, contextToken: string, text: string): Promise<void> {
+  function buildMessage(
+    toUserId: string,
+    contextToken: string,
+    item: MessageItem,
+  ): { clientId: string; msg: OutboundMessage } {
     const clientId = generateClientId();
+    return {
+      clientId,
+      msg: {
+        from_user_id: botAccountId,
+        to_user_id: toUserId,
+        client_id: clientId,
+        message_type: MessageType.BOT,
+        message_state: MessageState.FINISH,
+        context_token: contextToken,
+        item_list: [item],
+      },
+    };
+  }
 
-    const items: MessageItem[] = [
+  async function sendBuiltMessage(
+    label: string,
+    toUserId: string,
+    contextToken: string,
+    item: MessageItem,
+    logData: Record<string, unknown> = {},
+  ): Promise<void> {
+    const { clientId, msg } = buildMessage(toUserId, contextToken, item);
+    logger.info(`Sending ${label} message`, { toUserId, clientId, ...logData });
+    await api.sendMessage({ msg });
+    logger.info(`${label[0].toUpperCase()}${label.slice(1)} message sent`, { toUserId, clientId });
+  }
+
+  async function sendText(toUserId: string, contextToken: string, text: string): Promise<void> {
+    await sendBuiltMessage(
+      'text',
+      toUserId,
+      contextToken,
       {
         type: MessageItemType.TEXT,
         text_item: { text },
       },
-    ];
-
-    const msg: OutboundMessage = {
-      from_user_id: botAccountId,
-      to_user_id: toUserId,
-      client_id: clientId,
-      message_type: MessageType.BOT,
-      message_state: MessageState.FINISH,
-      context_token: contextToken,
-      item_list: items,
-    };
-
-    logger.info('Sending text message', { toUserId, clientId, textLength: text.length });
-    await api.sendMessage({ msg });
-    logger.info('Text message sent', { toUserId, clientId });
+      { textLength: text.length },
+    );
   }
 
   async function sendImage(toUserId: string, contextToken: string, imagePath: string, caption?: string): Promise<void> {
@@ -41,9 +62,10 @@ export function createSender(api: WeChatApi, botAccountId: string, baseUrl: stri
     }
 
     const upload = await uploadImage(baseUrl, token, toUserId, imagePath);
-    const clientId = generateClientId();
-
-    const items: MessageItem[] = [
+    await sendBuiltMessage(
+      'image',
+      toUserId,
+      contextToken,
       {
         type: MessageItemType.IMAGE,
         image_item: {
@@ -55,21 +77,8 @@ export function createSender(api: WeChatApi, botAccountId: string, baseUrl: stri
           mid_size: upload.filesize,
         },
       },
-    ];
-
-    const msg: OutboundMessage = {
-      from_user_id: botAccountId,
-      to_user_id: toUserId,
-      client_id: clientId,
-      message_type: MessageType.BOT,
-      message_state: MessageState.FINISH,
-      context_token: contextToken,
-      item_list: items,
-    };
-
-    logger.info('Sending image message', { toUserId, clientId, imagePath });
-    await api.sendMessage({ msg });
-    logger.info('Image message sent', { toUserId, clientId });
+      { imagePath },
+    );
   }
 
   async function sendFile(toUserId: string, contextToken: string, filePath: string, caption?: string): Promise<void> {
@@ -78,9 +87,10 @@ export function createSender(api: WeChatApi, botAccountId: string, baseUrl: stri
     }
 
     const upload = await uploadFile(baseUrl, token, toUserId, filePath);
-    const clientId = generateClientId();
-
-    const items: MessageItem[] = [
+    await sendBuiltMessage(
+      'file',
+      toUserId,
+      contextToken,
       {
         type: MessageItemType.FILE,
         file_item: {
@@ -93,27 +103,16 @@ export function createSender(api: WeChatApi, botAccountId: string, baseUrl: stri
           },
         },
       },
-    ];
-
-    const msg: OutboundMessage = {
-      from_user_id: botAccountId,
-      to_user_id: toUserId,
-      client_id: clientId,
-      message_type: MessageType.BOT,
-      message_state: MessageState.FINISH,
-      context_token: contextToken,
-      item_list: items,
-    };
-
-    logger.info('Sending file message', { toUserId, clientId, filePath });
-    await api.sendMessage({ msg });
-    logger.info('File message sent', { toUserId, clientId });
+      { filePath },
+    );
   }
 
   async function sendVoice(toUserId: string, contextToken: string, filePath: string): Promise<void> {
     const upload = await uploadVoice(baseUrl, token, toUserId, filePath);
-    const clientId = generateClientId();
-    const items: MessageItem[] = [
+    await sendBuiltMessage(
+      'voice',
+      toUserId,
+      contextToken,
       {
         type: MessageItemType.VOICE,
         voice_item: {
@@ -124,19 +123,8 @@ export function createSender(api: WeChatApi, botAccountId: string, baseUrl: stri
           },
         },
       },
-    ];
-    const msg: OutboundMessage = {
-      from_user_id: botAccountId,
-      to_user_id: toUserId,
-      client_id: clientId,
-      message_type: MessageType.BOT,
-      message_state: MessageState.FINISH,
-      context_token: contextToken,
-      item_list: items,
-    };
-    logger.info('Sending voice message', { toUserId, clientId, filePath });
-    await api.sendMessage({ msg });
-    logger.info('Voice message sent', { toUserId, clientId });
+      { filePath },
+    );
   }
 
   async function sendVideo(toUserId: string, contextToken: string, filePath: string, caption?: string): Promise<void> {
@@ -144,8 +132,10 @@ export function createSender(api: WeChatApi, botAccountId: string, baseUrl: stri
       await sendText(toUserId, contextToken, caption.trim());
     }
     const upload = await uploadVideo(baseUrl, token, toUserId, filePath);
-    const clientId = generateClientId();
-    const items: MessageItem[] = [
+    await sendBuiltMessage(
+      'video',
+      toUserId,
+      contextToken,
       {
         type: MessageItemType.VIDEO,
         video_item: {
@@ -157,19 +147,8 @@ export function createSender(api: WeChatApi, botAccountId: string, baseUrl: stri
           video_size: upload.filesize,
         },
       },
-    ];
-    const msg: OutboundMessage = {
-      from_user_id: botAccountId,
-      to_user_id: toUserId,
-      client_id: clientId,
-      message_type: MessageType.BOT,
-      message_state: MessageState.FINISH,
-      context_token: contextToken,
-      item_list: items,
-    };
-    logger.info('Sending video message', { toUserId, clientId, filePath });
-    await api.sendMessage({ msg });
-    logger.info('Video message sent', { toUserId, clientId });
+      { filePath },
+    );
   }
 
   return { sendText, sendImage, sendFile, sendVoice, sendVideo };

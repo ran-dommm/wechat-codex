@@ -285,7 +285,23 @@ npm run codex-auth -- delete work
 npm run cleanup-legacy
 ```
 
-## 7. 常见问题
+## 7. 代码结构
+
+当前运行路径只保留 native Codex TUI bridge：
+
+- `src/main.ts`：daemon 入口，组装 WeChat API、monitor、sender、session store 和 Codex bridge
+- `src/codex/native-bridge.ts`：Codex TUI 进程、PTY 注入、session log 轮询和回合状态
+- `src/codex/args.ts`：Codex 启动参数（模型、沙箱模式）
+- `src/codex/attachments.ts`：Codex final answer 中 `wechat-attachments` 块解析
+- `src/codex/rate-limits.ts`：Codex token_count 事件中的额度信息解析
+- `src/codex/session-log.ts`：定位当前 Codex session jsonl 文件
+- `src/wechat/`：微信登录、轮询、发送、上传、CDN 下载解密和消息类型定义
+- `src/media/transcribe.ts`：音视频探测、抽音轨/关键帧、whisper 转写
+- `src/commands/`：微信和终端 slash command 路由
+
+历史的 `codex exec --json` bridge 和独立 REPL 已移除，避免维护两套并行入口。
+
+## 8. 常见问题
 
 ### Q1: 启动时报“未找到账号”
 
@@ -312,15 +328,15 @@ ffprobe -version
 whisper --help
 ```
 
-### Q4: 改了 `/mode` 为什么没生效
+### Q4: 改了 `/mode` 或 `/model` 为什么没生效
 
-`/mode` 会写入会话设置，但要重启服务后才会按新模式启动 Codex：
+`/mode` 和 `/model` 会自动重启当前 Codex TUI 会话。若微信端提示重启失败，检查终端日志后重新启动服务：
 
 ```bash
 npm start
 ```
 
-## 8. 安全建议
+## 9. 安全建议
 
 - 除非你非常确定环境可信，否则不要用 `danger` 模式
 - 建议使用最小权限账号运行服务

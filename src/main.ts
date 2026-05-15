@@ -408,21 +408,6 @@ async function runDaemon(): Promise<void> {
     });
   }
 
-  async function sendImageToWechat(imagePath: string): Promise<void> {
-    const recipient = lastRecipient;
-    if (!recipient) {
-      logger.warn('Drop image: no WeChat recipient yet', { imagePath });
-      return;
-    }
-    await enqueueWechatSend(async () => {
-      try {
-        await retryWechatSend('send image', () => sender.sendImage(recipient.userId, recipient.contextToken, imagePath));
-      } catch (err) {
-        logger.warn('Failed to send image to WeChat', { error: err instanceof Error ? err.message : String(err) });
-      }
-    });
-  }
-
   async function sendAttachmentToWechat(
     attachment: { kind: 'image' | 'file' | 'voice' | 'video'; path: string },
   ): Promise<void> {
@@ -572,7 +557,7 @@ async function runDaemon(): Promise<void> {
 
     try {
       const result = useAuthProfile(profileName);
-      await bridge.restart(session.workingDirectory || config.workingDirectory);
+      await bridge.restart(session.workingDirectory || config.workingDirectory, currentBridgeMode(), currentBridgeModel());
       const lines = [
         `✅ Codex 认证账号已切换为: ${profileName}`,
         '已重启 Codex 会话。配置文件、AGENTS.md 和当前工作目录保持不变。',
@@ -591,6 +576,7 @@ async function runDaemon(): Promise<void> {
   // ── Native Codex Bridge ──
 
   const currentBridgeMode = (): CodexSpawnMode => (session.mode ?? config.mode ?? 'workspace') as CodexSpawnMode;
+  const currentBridgeModel = (): string | undefined => session.model ?? config.model;
 
   const mode = currentBridgeMode();
   const bridge = new NativeCodexBridge(cwd, {
@@ -631,7 +617,7 @@ async function runDaemon(): Promise<void> {
         text: message,
       });
       if (result.restartBridge) {
-        void bridge.restart(session.workingDirectory || config.workingDirectory, currentBridgeMode()).catch((err) => {
+        void bridge.restart(session.workingDirectory || config.workingDirectory, currentBridgeMode(), currentBridgeModel()).catch((err) => {
           logger.error('Failed to restart bridge after terminal command', {
             error: err instanceof Error ? err.message : String(err),
           });
@@ -651,7 +637,7 @@ async function runDaemon(): Promise<void> {
       monitor.stop();
       process.exit(code ?? 0);
     },
-  }, mode);
+  }, mode, currentBridgeModel());
 
   // ── WeChat Monitor ──
 
@@ -734,7 +720,7 @@ async function runDaemon(): Promise<void> {
         if (result.reply) {
           if (result.restartBridge) {
             try {
-              await bridge.restart(session.workingDirectory || config.workingDirectory, currentBridgeMode());
+              await bridge.restart(session.workingDirectory || config.workingDirectory, currentBridgeMode(), currentBridgeModel());
             } catch (err) {
               const errMsg = err instanceof Error ? err.message : String(err);
               logger.error('Failed to restart bridge after slash command', { command: slashCommand, error: errMsg });
